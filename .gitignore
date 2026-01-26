@@ -1,0 +1,15 @@
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+outputs/
+calibration/*.npy
+data_test/*.mp4
+yolov8n.pt
+.trae/documents/

@@ -1,0 +1,37 @@
+units:
+  output: "kmh"
+
+raw_speed:
+  min_dt_s: 0.04
+  max_dt_s: 1.0
+  min_displacement_m: 0.05
+
+turning:
+  window: 5
+  window_s: 0.5
+  max_turn_rate_deg_per_s: 300.0
+  theta_min_deg: 8.0
+  curvature_min_1pm: 0.015
+
+turn_speed_limit:
+  enabled: true
+  mode: "curvature"
+  a_lat_max_mps2: 2.5
+  v_max_kmh: 180.0
+  v_min_kmh: 30.0
+  angle_max_deg: 60.0
+  alpha: 0.5
+
+accel_limit:
+  enabled: true
+  a_max_mps2: 6.0
+
+smoothing:
+  method: "ema"
+  ema_alpha: 0.35
+  max_gap_s: 1.0
+
+ablations:
+  disable_turn_limit: false
+  disable_accel_limit: false
+  disable_smoothing: false

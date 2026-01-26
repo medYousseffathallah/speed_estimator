@@ -1,0 +1,58 @@
+camera_id: "cam_02"
+source:
+  type: "file"
+  uri: "data/cam_02.mp4"
+  params: {}
+
+calibration:
+  homography_npy: "calibration/cam_02_H.npy"
+
+runtime:
+  fps_hint: 30.0
+  resize:
+    enabled: true
+    width: 1280
+    height: 720
+
+detection:
+  backend: "ultralytics_yolo"
+  params:
+    model_path: "yolov8n.pt"
+    conf_threshold: 0.3
+    iou_threshold: 0.45
+    device: "cpu"
+    class_whitelist: ["car", "truck", "bus", "motorcycle", "bicycle"]
+
+roi:
+  enabled: false
+  polygon_xy: []
+
+output:
+  overlay:
+    enabled: true
+    show: false
+    write_video: false
+    video_path: "outputs/visualizations/cam_02_overlay.mp4"
+    draw_vectors: true
+    trail_length: 30
+    trail_color_bgr: [0, 255, 255]
+    vector_color_bgr: [0, 0, 255]
+    trail_thickness: 2
+    vector_thickness: 2
+    vector_tip_length: 0.3
+  csv:
+    enabled: true
+    path: "outputs/speeds/cam_02_speeds.csv"
+  jsonl:
+    enabled: true
+    path: "outputs/speeds/cam_02_speeds.jsonl"
+
+alerts:
+  enabled: false
+  speed_limit_kmh: 50.0
+  threshold_kmh: 5.0
+  min_consecutive_samples: 5
+  cooldown_s: 10.0
+  use_speed: "smoothed"
+  notifier:
+    type: "log"

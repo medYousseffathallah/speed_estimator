@@ -1,0 +1,15 @@
+reconnect:
+  enabled: false
+  max_retries: 0
+  backoff_s: 1.0
+  reset_on_success: true
+
+rtsp:
+  use_gstreamer: false
+  transport: "tcp"
+  latency_ms: 120
+  drop_on_latency: true
+  decoder: "avdec_h264"
+
+http:
+  enabled: true
