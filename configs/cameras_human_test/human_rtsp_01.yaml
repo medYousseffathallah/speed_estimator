@@ -1,0 +1,49 @@
+camera_id: "human_rtsp_01"
+source:
+  type: "rtsp"
+  uri: "rtsp://admin:admin@192.168.1.17:8554/live"
+  params: {}
+
+calibration:
+  homography_npy: "calibration/human_rtsp_01_H.npy"
+  meters_per_pixel: 0.02
+
+runtime:
+  fps_hint: 30.0
+  resize:
+    enabled: false
+    width: 1280
+    height: 720
+
+detection:
+  backend: "ultralytics_yolo"
+  params:
+    model_path: "yolov8n.pt"
+    conf_threshold: 0.25
+    iou_threshold: 0.45
+    device: "cpu"
+    class_whitelist: ["person"]
+
+roi:
+  enabled: false
+  polygon_xy: []
+
+output:
+  overlay:
+    enabled: true
+    show: true
+    write_video: false
+    video_path: "outputs/human_test/visualizations/human_rtsp_01_overlay.mp4"
+    draw_vectors: true
+    trail_length: 20
+    trail_thickness: 2
+    vector_thickness: 2
+  csv:
+    enabled: true
+    path: "outputs/human_test/speeds/human_rtsp_01_speeds.csv"
+  jsonl:
+    enabled: false
+    path: "outputs/human_test/speeds/human_rtsp_01_speeds.jsonl"
+
+alerts:
+  enabled: false

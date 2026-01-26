@@ -18,11 +18,22 @@ configs/
   cameras/
     cam_01.yaml
     cam_02.yaml
+  cameras_gttet/
+    gttet.yaml
+  cameras_human_test/
+    human_rtsp_01.yaml
+  cameras_test_single/
+    normanniles3.yaml
   tracking.yaml
+  tracking_human.yaml
   speed_model.yaml
+  speed_model_human.yaml
+  camera_handling.yaml
 calibration/
   cam_01_H.npy
   cam_02_H.npy
+docs/
+  pipeline_architecture.md
 src/
   speedestimation/
     detection/
@@ -31,10 +42,13 @@ src/
     speed_estimation/
     turning_model/
     fusion/
+    io/
+    output/
     utils/
 scripts/
   calibrate_camera.py
   run_pipeline.py
+  run_video_test.py
   evaluate.py
 outputs/
   logs/
@@ -42,6 +56,38 @@ outputs/
   visualizations/
 tests/
 ```
+
+## File and Folder Explanations
+
+- configs/: All runtime configuration in YAML.
+- configs/cameras/: Per-camera configuration files for standard multi-camera runs.
+- configs/cameras_gttet/: Example camera set for GT TET runs.
+- configs/cameras_human_test/: RTSP cameras and settings for human-speed testing.
+- configs/cameras_test_single/: Single-camera test inputs.
+- configs/tracking.yaml: Default tracking backend and parameters.
+- configs/tracking_human.yaml: Human tracking settings (person class filter, tuned thresholds).
+- configs/speed_model.yaml: Vehicle speed estimation parameters.
+- configs/speed_model_human.yaml: Human speed estimation tuning (limits and smoothing).
+- configs/camera_handling.yaml: Camera input/RTSP handling options.
+- calibration/: Saved homography matrices (image → world) per camera.
+- docs/pipeline_architecture.md: Full pipeline architecture and step-by-step guide.
+- src/speedestimation/: Core library code.
+- scripts/: CLI entry points for calibration, pipelines, and evaluation.
+- outputs/: Generated logs, speed data, and visualizations.
+- tests/: Unit and integration tests.
+
+## Source Package Overview
+
+- detection/: Detector interfaces, registry, and YOLO adapters.
+- tracking/: Tracker interfaces and adapters (IoU, SORT, ByteTrack).
+- geometry/: Calibration, homography, and ROI helpers.
+- io/: Camera ingestion and video utilities.
+- speed_estimation/: Speed math, smoothing, limits, and units.
+- turning_model/: Turn angle and curvature estimation.
+- output/: Overlays, trails, alerts, and output sinks.
+- pipeline/: Single and multi-camera orchestration.
+- fusion/: Multi-camera fusion interfaces.
+- utils/: Shared utilities (config loading, logging, geometry helpers, types).
 
 ## Jetson Notes (Nano / Orin)
 
@@ -74,4 +120,25 @@ python scripts/run_pipeline.py --cameras configs/cameras --tracking configs/trac
 - `configs/cameras/*.yaml` defines per-camera ingestion, homography path, and per-camera thresholds.
 - `configs/tracking.yaml` defines tracker backend and parameters.
 - `configs/speed_model.yaml` defines speed math parameters, turn limits, smoothing, and ablation flags.
+- `configs/camera_handling.yaml` defines RTSP, buffering, and read settings.
+- `configs/tracking_human.yaml` and `configs/speed_model_human.yaml` isolate human-speed tuning.
 
+## Human Testing Branch (RTSP)
+
+- Purpose: isolate human-speed tests from vehicle defaults.
+- Branch: `human-speed-tests`.
+- Configs: `configs/cameras_human_test/`, `configs/tracking_human.yaml`, `configs/speed_model_human.yaml`.
+- Output paths: `outputs/human_test/<camera_id>/...`.
+
+Run:
+
+```bash
+python scripts/run_pipeline.py --cameras configs/cameras_human_test --tracking configs/tracking_human.yaml --speed configs/speed_model_human.yaml --camera-handling configs/camera_handling.yaml --log-level INFO
+```
+
+## Scripts
+
+- calibrate_camera.py: Create homography from a camera YAML file.
+- run_pipeline.py: Multi-camera pipeline from a folder of camera YAMLs.
+- run_video_test.py: Single video run with explicit homography.
+- evaluate.py: Offline evaluation helpers.

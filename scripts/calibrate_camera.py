@@ -37,7 +37,9 @@ def main() -> None:
     cam = load_yaml(resolve_path(args.camera, base_dir))
     cam_id = str(cam.get("camera_id", "cam"))
     src = cam.get("source", {})
-    uri = resolve_path(str(src.get("uri", "")), base_dir)
+    source_type = str(src.get("type", "file")).lower()
+    raw_uri = str(src.get("uri", ""))
+    uri = resolve_path(raw_uri, base_dir) if source_type == "file" else raw_uri
     cap = cv2.VideoCapture(uri)
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open source: {uri}")

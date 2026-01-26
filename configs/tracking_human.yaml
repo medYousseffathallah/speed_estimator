@@ -1,0 +1,8 @@
+backend: "bytetrack"
+params:
+  iou_threshold: 0.2
+  max_age_frames: 45
+  min_hits: 2
+  high_conf_threshold: 0.5
+  low_conf_threshold: 0.1
+  class_whitelist: ["person"]

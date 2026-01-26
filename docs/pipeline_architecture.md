@@ -94,6 +94,60 @@ python scripts/run_pipeline.py --cameras configs/cameras_gttet
 python scripts/run_video_test.py --video <VIDEO> --camera-id <CAMERA_ID> --homography <HOMOGRAPHY_NPY> --tracking configs/tracking.yaml --speed configs/speed_model.yaml --camera-handling configs/camera_handling.yaml --log-level INFO
 ```
 
+## Human Speed Testing (RTSP) — Isolated Workflow
+
+Use a dedicated branch and config folder so human‑tracking experiments do not impact vehicle tracking defaults.
+
+### Proposed Isolation Layout
+
+- Branch: `human-speed-tests`
+- Config folder: `configs/cameras_human_test/`
+- Tracking config: `configs/tracking_human.yaml`
+- Optional speed tuning: `configs/speed_model_human.yaml`
+- Outputs: `outputs/human_test/<camera_id>/...`
+
+### Human RTSP Camera YAML (key fields)
+
+- `source.type: "rtsp"`
+- `source.uri: "rtsp://<user>:<pass>@<ip>:<port>/<path>"`
+- `runtime.fps_hint`: set to expected stream FPS
+- `detection.params.class_whitelist: ["person"]`
+- `output.overlay.show: true` while validating connectivity
+- `output.csv.path` / `output.jsonl.path` under `outputs/human_test/...`
+
+### Human Tracking Config (key fields)
+
+- `backend`: keep current tracker unless needed to switch
+- `params.class_whitelist: ["person"]`
+- Adjust thresholds for lower speeds and smaller targets if needed
+
+### Human Speed Model (optional)
+
+- Lower `max_speed_kmh` and acceleration limits for pedestrians
+- Increase smoothing if jittery; decrease if responsiveness is needed
+
+### RTSP Connectivity Validation
+
+1. Start with `source.type: "rtsp"`, `source.uri` from the phone app.
+2. If frames drop, enable `rtsp.use_gstreamer: true` in `configs/camera_handling.yaml` or override per‑camera params.
+3. Use `output.overlay.show: true` for a quick visual confirmation.
+
+### Run Command (human test folder)
+
+```bash
+python scripts/run_pipeline.py --cameras configs/cameras_human_test --tracking configs/tracking_human.yaml --speed configs/speed_model_human.yaml --camera-handling configs/camera_handling.yaml --log-level INFO
+```
+
+## Tasks to Finish Human Tracking Without Affecting Main Project
+
+1. Create a new branch and isolate configs under `configs/cameras_human_test/`.
+2. Add a human‑focused tracking config with `class_whitelist: ["person"]`.
+3. Add or tune a human speed model (limits and smoothing).
+4. Add one RTSP camera YAML with correct URI and outputs under `outputs/human_test/`.
+5. Validate RTSP connectivity with overlay enabled and confirm detections.
+6. Calibrate homography or set `meters_per_pixel` for provisional speed scale.
+7. Run the multi‑camera pipeline using the human configs and review CSV/JSONL output.
+
 ## Adding a New Camera
 
 1. Copy an existing camera YAML into `configs/cameras` and update fields:
