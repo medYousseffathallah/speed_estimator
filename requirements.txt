@@ -1,3 +1,4 @@
 numpy>=1.23
 PyYAML>=6.0
-opencv-python-headless>=4.8
+opencv-python>=4.8  # Use full opencv-python on PC, switch to system opencv on Jetson
+# opencv-python>=4.8 # Comment out for Jetson - use system opencv-python instead  
