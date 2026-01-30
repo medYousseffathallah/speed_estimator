@@ -17,9 +17,10 @@ from speedestimation.output.alerts import SpeedAlertConfig, SpeedAlertEngine
 from speedestimation.output.overlay import OverlayRenderer
 from speedestimation.output.notifier import Notifier, create_notifier
 from speedestimation.output.sinks import CsvSink, JsonlSink, SpeedSinks
-from speedestimation.output.trails import TrackTrails
+from speedestimation.output.trails import DotTrails
 from speedestimation.utils.types import SpeedSample
 from speedestimation.speed_estimation.estimator import SpeedEstimator, SpeedEstimatorConfig
+from speedestimation.speed_estimation.smoothing import EmaSmoother, PolySmoother
 from speedestimation.tracking.base import TrackerInput
 from speedestimation.tracking.registry import create_tracker
 from speedestimation.utils.config import resolve_path
@@ -60,6 +61,15 @@ class CameraPipeline:
         self._speed_cfg = SpeedEstimatorConfig.from_dict(cfg.speed)
         self._estimator = SpeedEstimator(self._speed_cfg)
 
+        ps_cfg = dict(cfg.speed.get("position_smoothing", {}) or {})
+        self._pos_smoothing_method = str(ps_cfg.get("method", "")).lower()
+        self._pos_smoothing_enabled = bool(ps_cfg.get("enabled", True)) and self._pos_smoothing_method in {"ema", "poly"}
+        self._pos_smoothing_alpha = float(ps_cfg.get("ema_alpha", self._speed_cfg.smoothing_alpha))
+        self._pos_smoothing_max_gap_s = float(ps_cfg.get("max_gap_s", self._speed_cfg.smoothing_max_gap_s))
+        self._pos_smoothing_window = int(ps_cfg.get("window", 8))
+        self._pos_smoothing_poly_degree = int(ps_cfg.get("poly_degree", 2))
+        self._pos_smoothers: Dict[int, Tuple[Any, Any]] = {}
+
         out_cfg = cfg.camera.get("output", {})
         csv_cfg = out_cfg.get("csv", {})
         jsonl_cfg = out_cfg.get("jsonl", {})
@@ -71,7 +81,11 @@ class CameraPipeline:
         self._overlay_cfg = out_cfg.get("overlay", {})
         self._overlay_renderer = OverlayRenderer(units=str(cfg.speed.get("units", {}).get("output", "kmh")).lower())
         self._latest_speed_by_track: Dict[int, SpeedSample] = {}
-        self._trails = TrackTrails(max_len=int(self._overlay_cfg.get("trail_length", 30)))
+        self._dot_trails = DotTrails(
+            max_len=int(self._speed_cfg.dot_buffer_size),
+            min_distance_m=float(self._speed_cfg.dot_min_distance_m),
+            min_dt_s=float(self._speed_cfg.dot_min_dt_s),
+        )
 
         alerts_cfg = cfg.camera.get("alerts", {}) or {}
         self._alerts = SpeedAlertEngine(SpeedAlertConfig.from_dict(dict(alerts_cfg)))
@@ -122,12 +136,43 @@ class CameraPipeline:
                         if point_in_polygon(cx, cy, self._roi_polygon):
                             filtered.append(ts)
                     output_tracks = filtered
+                self._prune_pos_smoothers([ts.track_id for ts in output_tracks])
+                self._prune_latest_speeds([ts.track_id for ts in output_tracks])  # CRITICAL FIX: Remove stale speed cache
 
                 tracks: List[Track] = []
+                dot_inputs: List[Tuple[int, Tuple[float, float], Tuple[float, float], float]] = []
                 for ts in output_tracks:
                     world_xy = None
                     x1, y1, x2, y2 = ts.bbox_xyxy
                     cx, cy = (0.5 * (x1 + x2), y2)
+                    if self._pos_smoothing_enabled:
+                        sm = self._pos_smoothers.get(ts.track_id)
+                        if sm is None:
+                            if self._pos_smoothing_method == "ema":
+                                sm = (
+                                    EmaSmoother(alpha=self._pos_smoothing_alpha, max_gap_s=self._pos_smoothing_max_gap_s),
+                                    EmaSmoother(alpha=self._pos_smoothing_alpha, max_gap_s=self._pos_smoothing_max_gap_s),
+                                )
+                            elif self._pos_smoothing_method == "poly":
+                                sm = (
+                                    PolySmoother(degree=self._pos_smoothing_poly_degree, window=self._pos_smoothing_window),
+                                    PolySmoother(degree=self._pos_smoothing_poly_degree, window=self._pos_smoothing_window),
+                                )
+                            else:
+                                sm = (
+                                    KalmanSmoother(process_noise=self._pos_smoothing_kalman_process_noise, measurement_noise=self._pos_smoothing_kalman_measurement_noise),
+                                    KalmanSmoother(process_noise=self._pos_smoothing_kalman_process_noise, measurement_noise=self._pos_smoothing_kalman_measurement_noise),
+                                )
+                            self._pos_smoothers[ts.track_id] = sm
+                        
+                        measurement_x = float(cx)
+                        measurement_y = float(cy)
+                        if not is_detection_frame and self._pos_smoothing_method == "kalman":
+                            measurement_x = None
+                            measurement_y = None
+                            
+                        cx = sm[0].update(measurement_x, float(t_s))
+                        cy = sm[1].update(measurement_y, float(t_s))
                     if self._homography is not None:
                         wx, wy = self._homography.transform_point((cx, cy))
                         if wx != wx or wy != wy:
@@ -136,6 +181,8 @@ class CameraPipeline:
                     elif self._use_pixel_scale:
                         world_xy = (cx * self._meters_per_pixel, cy * self._meters_per_pixel)
                     tracks.append(Track(camera_id=self._camera.camera_id, frame_index=frame_index, timestamp_s=t_s, state=ts, world_xy_m=world_xy))
+                    if world_xy is not None:
+                        dot_inputs.append((int(ts.track_id), (float(world_xy[0]), float(world_xy[1])), (float(cx), float(cy)), float(t_s)))
 
                 samples = self._estimator.update(tracks)
                 self._estimator.prune_missing([(self._camera.camera_id, ts.track_id) for ts in output_tracks])
@@ -150,7 +197,7 @@ class CameraPipeline:
                     self._alerts.prune_missing([ts.track_id for ts in output_tracks])
 
                 if bool(self._overlay_cfg.get("enabled", False)):
-                    trails_by_track = self._trails.update(output_tracks)
+                    trails_by_track = self._dot_trails.update(dot_inputs)
                     overlay = self._overlay_renderer.draw(
                         frame_bgr,
                         output_tracks,
@@ -179,6 +226,7 @@ class CameraPipeline:
                 cv2.destroyWindow(self._camera.camera_id)
             except Exception:
                 pass
+            self._pos_smoothers.clear()
 
     def _write_overlay_frame(self, frame_bgr, fps: float) -> None:
         path = resolve_path(str(self._overlay_cfg.get("video_path", "")), self._cfg.base_dir)
@@ -198,6 +246,25 @@ class CameraPipeline:
         if self._video_writer is not None:
             self._video_writer.release()
         self._video_writer = None
+
+    def _prune_pos_smoothers(self, alive_track_ids: List[int]) -> None:
+        if not self._pos_smoothers:
+            return
+        alive = set(int(x) for x in alive_track_ids)
+        to_del = [tid for tid in self._pos_smoothers.keys() if tid not in alive]
+        for tid in to_del:
+            del self._pos_smoothers[tid]
+
+    def _prune_latest_speeds(self, alive_track_ids: List[int]) -> None:
+        """CRITICAL FIX: Remove stale speed cache entries for tracks that are no longer active."""
+        if not self._latest_speed_by_track:
+            return
+        alive = set(int(x) for x in alive_track_ids)
+        to_del = [tid for tid in self._latest_speed_by_track.keys() if tid not in alive]
+        for tid in to_del:
+            del self._latest_speed_by_track[tid]
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("pruned stale speed cache: track_id=%d", tid)
 
     def _resolve_camera_uri(self) -> str:
         st = str(self._camera.source_type).lower()

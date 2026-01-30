@@ -1,8 +1,8 @@
 backend: "bytetrack"
 params:
-  iou_threshold: 0.2
+  iou_threshold: 0.5
   max_age_frames: 30
-  min_hits: 2
-  high_conf_threshold: 0.6
-  low_conf_threshold: 0.1
+  min_hits: 4
+  high_conf_threshold: 0.7
+  low_conf_threshold: 0.3
   class_whitelist: ["car", "truck", "bus", "motorcycle"]

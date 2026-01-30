@@ -10,7 +10,7 @@ calibration:
 runtime:
   fps_hint: 30.0
   resize:
-    enabled: true
+    enabled: false
     width: 1280
     height: 720
 
@@ -19,7 +19,7 @@ detection:
   params:
     model_path: "yolov8n.pt"
     conf_threshold: 0.3
-    iou_threshold: 0.45
+    iou_threshold: 0.5
     device: "cpu" # Change to "cuda" if you have a GPU
     class_whitelist: ["car", "truck", "bus", "motorcycle", "bicycle"]
 
@@ -30,7 +30,8 @@ roi:
 output:
   overlay:
     enabled: true
-    show: true
+    show: true # Disabled to avoid OpenCV GUI issues on Windows
+    show_turn_angle: true
     write_video: true
     video_path: "outputs/visualizations/normanniles_overlay.mp4"
     draw_vectors: true

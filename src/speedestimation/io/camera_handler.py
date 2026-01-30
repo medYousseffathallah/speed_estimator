@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, Optional, Tuple
@@ -75,6 +76,9 @@ class CameraHandlerConfig:
         )
 
 
+logger = logging.getLogger("speedestimation.io.camera")
+
+
 class CameraHandler:
     def __init__(self, cfg: CameraHandlerConfig) -> None:
         self._cfg = cfg
@@ -90,6 +94,7 @@ class CameraHandler:
             cap = self._cap
             if cap is None:
                 if not self._try_reconnect():
+                    logger.error("Camera source unavailable and reconnect disabled: %s", self._cfg.uri)
                     break
                 cap = self._cap
                 if cap is None:
@@ -97,8 +102,10 @@ class CameraHandler:
 
             ok, frame = cap.read()
             if not ok:
+                logger.warning("Failed to read frame from source: %s", self._cfg.uri)
                 self._close()
                 if not self._try_reconnect():
+                    logger.error("Reconnect failed for source: %s", self._cfg.uri)
                     break
                 continue
 
@@ -122,10 +129,13 @@ class CameraHandler:
 
     def _try_reconnect(self) -> bool:
         if not self._cfg.reconnect.enabled:
+            logger.error("Reconnect disabled for source: %s", self._cfg.uri)
             return False
         if self._cfg.reconnect.max_retries > 0 and self._retries >= self._cfg.reconnect.max_retries:
+            logger.error("Reconnect retries exhausted for source: %s", self._cfg.uri)
             return False
         self._retries += 1
+        logger.info("Reconnecting to source (%d): %s", self._retries, self._cfg.uri)
         time.sleep(max(0.0, float(self._cfg.reconnect.backoff_s)))
         return self._open()
 
@@ -137,8 +147,19 @@ class CameraHandler:
         else:
             cap = cv2.VideoCapture(uri, api)
         if not cap.isOpened():
-            self._cap = None
-            return False
+            if self._cfg.source_type.lower() == "rtsp" and self._cfg.rtsp.use_gstreamer:
+                fallback = cv2.VideoCapture(self._cfg.uri)
+                if fallback.isOpened():
+                    logger.warning("GStreamer failed; falling back to OpenCV backend for %s", self._cfg.uri)
+                    cap = fallback
+                else:
+                    logger.error("Failed to open RTSP stream: %s", self._cfg.uri)
+                    self._cap = None
+                    return False
+            else:
+                logger.error("Failed to open source: %s", self._cfg.uri)
+                self._cap = None
+                return False
 
         try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)

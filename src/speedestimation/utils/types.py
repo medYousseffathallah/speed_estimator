@@ -96,7 +96,7 @@ class CameraConfig:
             source_uri=str(source.get("uri", "")),
             source_params=dict(source.get("params", {}) or {}),
             homography_npy=str(calibration.get("homography_npy", "")),
-            meters_per_pixel=float(calibration.get("meters_per_pixel", 1.0)),
+            meters_per_pixel=float(calibration.get("meters_per_pixel", 0.5)),
             fps_hint=float(runtime.get("fps_hint", 30.0)),
             resize_enabled=bool(resize.get("enabled", False)),
             resize_width=int(resize.get("width", 1280)),

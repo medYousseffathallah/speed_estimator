@@ -1,17 +1,31 @@
+mode: "advanced"
+simple_speed:
+  window_s: 0.5
+  axis: "xy"
+  method: "displacement"
+
 units:
   output: "kmh"
 
 raw_speed:
   min_dt_s: 0.04
   max_dt_s: 1.0
-  min_displacement_m: 0.05
+  min_displacement_m: 0.15
+  min_speed_mps: 0.03
+  stop_time_s: 0.5          # Minimum time window for authoritative stop detection (0.5s)
+  min_arc_length_m: 0.1     # Minimum arc length for stop detection (0.1m)
+
+dots:
+  min_distance_m: 0.45  # Recommended range: 0.3-0.6m for urban traffic, 0.5-1.0m for highway
+  min_dt_s: 0.3         # Recommended range: 0.2-0.5s to avoid jitter while maintaining responsiveness
+  buffer_size: 5        # Fixed at 5 for optimal turning detection (first 2 + last 2 dots)
 
 turning:
-  window: 5
-  window_s: 0.5
-  max_turn_rate_deg_per_s: 300.0
-  theta_min_deg: 8.0
-  curvature_min_1pm: 0.015
+  max_turn_rate_deg_per_s: 300.0  # Maximum realistic turn rate for vehicles
+  theta_min_deg: 5.0             # Increased from 2° to 5° for better real-world performance
+  curvature_min_1pm: 0.005       # Increased from 0.002 to 0.005 for better sensitivity
+  min_arc_len_m: 0.1              # Increased from 0.05m to 0.1m for more stable angles
+  persist_s: 0.25                  # Keep short to avoid false positives
 
 turn_speed_limit:
   enabled: true
@@ -24,12 +38,22 @@ turn_speed_limit:
 
 accel_limit:
   enabled: true
-  a_max_mps2: 6.0
+  a_max_mps2: 60.0
 
 smoothing:
   method: "ema"
+  ema_alpha: 0.25
+  max_gap_s: 1.0
+
+position_smoothing:
+  enabled: true
+  method: "kalman"
+  window: 12
+  poly_degree: 2
   ema_alpha: 0.35
   max_gap_s: 1.0
+  kalman_process_noise: 1.0
+  kalman_measurement_noise: 2.0
 
 ablations:
   disable_turn_limit: false

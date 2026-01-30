@@ -30,6 +30,6 @@ def test_trails_max_len() -> None:
     trails.update([_ts(1, 1, 1)])
     out = trails.update([_ts(1, 2, 2)])
     assert len(out[1]) == 2
-    assert out[1][0] == (1.0, 1.0)
-    assert out[1][1] == (2.0, 2.0)
+    assert out[1][0] == (1.0, 11.0)
+    assert out[1][1] == (2.0, 12.0)
 

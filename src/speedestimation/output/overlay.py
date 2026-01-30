@@ -36,6 +36,7 @@ class OverlayRenderer:
             p2 = (int(x2), int(y2))
             cv2.rectangle(img, p1, p2, (0, 255, 0), 2)
 
+            sp = latest_speeds.get(ts.track_id)
             if trails_by_track is not None:
                 pts = trails_by_track.get(ts.track_id, [])
                 if len(pts) >= 2:
@@ -52,9 +53,10 @@ class OverlayRenderer:
                             int(vector_thickness),
                             tipLength=float(vector_tip_length),
                         )
+                for x, y in pts:
+                    cv2.circle(img, (int(x), int(y)), max(2, int(trail_thickness) + 1), trail_color_bgr, -1)
 
             label = f"id={ts.track_id} {ts.class_name}"
-            sp = latest_speeds.get(ts.track_id)
             if sp is not None:
                 v = sp.speed_mps_smoothed
                 if self.units == "kmh":
@@ -64,7 +66,14 @@ class OverlayRenderer:
                 if show_heading:
                     label += f" hdg={sp.heading_deg:.1f}°"
                 if show_turn_angle:
-                    label += f" turn={sp.turn_angle_deg:.1f}°"
+                    applied = bool(sp.metadata.get("turn_applied", 0.0) > 0.5)
+                    state = "applied" if applied else ("detected" if sp.turn_angle_deg > 0.0 else "none")
+                    # Add direction indicator based on signed angle if available
+                    signed_angle = sp.metadata.get("turn_angle_signed_deg", 0.0)
+                    direction = ""
+                    if abs(signed_angle) > 0.1:  # Only show direction for meaningful angles
+                        direction = " L" if signed_angle > 0 else " R"
+                    label += f" turn={sp.turn_angle_deg:.1f}°{direction} ({state})"
             cv2.putText(img, label, (p1[0], max(0, p1[1] - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
         return img
 

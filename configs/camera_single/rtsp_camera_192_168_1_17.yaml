@@ -1,11 +1,15 @@
-camera_id: "gttet"
+camera_id: "rtsp_camera_192_168_1_17"
 source:
-  type: "file"
-  uri: "data_test/gttet.mp4"
-  params: {}
+  type: "rtsp"
+  uri: "rtsp://admin:admin@192.168.1.164:8554/live"
+  params:
+    buffer_size: 65536
+    timeout: 10000  # milliseconds
+    reconnect_attempts: 5
+    reconnect_delay: 2000  # milliseconds
 
 calibration:
-  homography_npy: "calibration/gttet_H.npy"
+  homography_npy: "calibration/rtsp_camera_192_168_1_17_H.npy"
 
 runtime:
   fps_hint: 30.0
@@ -31,10 +35,10 @@ roi:
 output:
   overlay:
     enabled: true
-    show: true # Disabled to avoid OpenCV GUI issues on Windows
+    show: true  # Set to true if you want to see the video window
     write_video: true
     show_turn_angle: true
-    video_path: "outputs/visualizations/gttet_overlay.mp4"
+    video_path: "outputs/visualizations/rtsp_camera_192_168_1_17_overlay.mp4"
     draw_vectors: true
     trail_length: 30
     trail_thickness: 2
@@ -42,10 +46,10 @@ output:
 
   csv:
     enabled: true
-    path: "outputs/speeds/gttet_speeds.csv"
+    path: "outputs/speeds/rtsp_camera_192_168_1_17_speeds.csv"
   jsonl:
     enabled: false
-    path: "outputs/speeds/gttet_speeds.jsonl"
+    path: "outputs/speeds/rtsp_camera_192_168_1_17_speeds.jsonl"
 
 alerts:
   enabled: false

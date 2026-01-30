@@ -16,22 +16,14 @@ This repository provides a modular, configuration-driven pipeline for estimating
 ```
 configs/
   cameras/
-    cam_01.yaml
-    cam_02.yaml
-  cameras_gttet/
     gttet.yaml
-  cameras_human_test/
-    human_rtsp_01.yaml
-  cameras_test_single/
-    normanniles3.yaml
+    test_normanniles.yaml
   tracking.yaml
-  tracking_human.yaml
   speed_model.yaml
-  speed_model_human.yaml
   camera_handling.yaml
 calibration/
-  cam_01_H.npy
-  cam_02_H.npy
+  gttet_H.npy
+  normanniles_H.npy
 docs/
   pipeline_architecture.md
 src/
@@ -61,13 +53,8 @@ tests/
 
 - configs/: All runtime configuration in YAML.
 - configs/cameras/: Per-camera configuration files for standard multi-camera runs.
-- configs/cameras_gttet/: Example camera set for GT TET runs.
-- configs/cameras_human_test/: RTSP cameras and settings for human-speed testing.
-- configs/cameras_test_single/: Single-camera test inputs.
 - configs/tracking.yaml: Default tracking backend and parameters.
-- configs/tracking_human.yaml: Human tracking settings (person class filter, tuned thresholds).
 - configs/speed_model.yaml: Vehicle speed estimation parameters.
-- configs/speed_model_human.yaml: Human speed estimation tuning (limits and smoothing).
 - configs/camera_handling.yaml: Camera input/RTSP handling options.
 - calibration/: Saved homography matrices (image → world) per camera.
 - docs/pipeline_architecture.md: Full pipeline architecture and step-by-step guide.
@@ -96,20 +83,20 @@ tests/
 
 ## Quickstart
 
-1) Install:
+1. Install:
 
 ```bash
 python -m pip install -r requirements.txt
 python -m pip install -e .
 ```
 
-2) Calibrate each camera (produces `calibration/<cam>_H.npy`):
+2. Calibrate each camera (produces `calibration/<cam>_H.npy`):
 
 ```bash
-python scripts/calibrate_camera.py --camera configs/cameras/cam_01.yaml
+python scripts/calibrate_camera.py --camera configs/cameras/gttet.yaml
 ```
 
-3) Run multi-camera pipeline:
+3. Run multi-camera pipeline:
 
 ```bash
 python scripts/run_pipeline.py --cameras configs/cameras --tracking configs/tracking.yaml --speed configs/speed_model.yaml
@@ -121,20 +108,6 @@ python scripts/run_pipeline.py --cameras configs/cameras --tracking configs/trac
 - `configs/tracking.yaml` defines tracker backend and parameters.
 - `configs/speed_model.yaml` defines speed math parameters, turn limits, smoothing, and ablation flags.
 - `configs/camera_handling.yaml` defines RTSP, buffering, and read settings.
-- `configs/tracking_human.yaml` and `configs/speed_model_human.yaml` isolate human-speed tuning.
-
-## Human Testing Branch (RTSP)
-
-- Purpose: isolate human-speed tests from vehicle defaults.
-- Branch: `human-speed-tests`.
-- Configs: `configs/cameras_human_test/`, `configs/tracking_human.yaml`, `configs/speed_model_human.yaml`.
-- Output paths: `outputs/human_test/<camera_id>/...`.
-
-Run:
-
-```bash
-python scripts/run_pipeline.py --cameras configs/cameras_human_test --tracking configs/tracking_human.yaml --speed configs/speed_model_human.yaml --camera-handling configs/camera_handling.yaml --log-level INFO
-```
 
 ## Scripts
 

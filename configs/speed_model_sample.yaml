@@ -1,0 +1,212 @@
+use_case: "urban_intersection_fixed_cam"
+explanation:
+  summary: "Dot-based speed and turning for fixed intersection cameras with jittery detections"
+  when_to_use:
+    - "Static roadside or pole-mounted camera"
+    - "Moderate traffic speeds with frequent turns"
+    - "Bounding-box jitter visible in raw detections"
+  adjustable_fields:
+    - "raw_speed.min_dt_s, raw_speed.max_dt_s, raw_speed.min_displacement_m, raw_speed.min_speed_mps"
+    - "dots.min_distance_m, dots.min_dt_s, dots.buffer_size"
+    - "turning.max_turn_rate_deg_per_s, turning.theta_min_deg, turning.curvature_min_1pm, turning.min_arc_len_m, turning.persist_s"
+    - "turn_speed_limit.*, accel_limit.*, smoothing.*"
+  notes:
+    - "Increase dots.min_distance_m and dots.min_dt_s if jitter still creates dots"
+    - "Lower turning.theta_min_deg for gentle turns at low speed"
+    - "Raise turn_speed_limit.a_lat_max_mps2 for higher-speed turns"
+
+field_reference:
+  mode:
+    type: "string"
+    options: ["advanced", "simple"]
+    description: "advanced uses dot-based turning; simple uses dot-based displacement only"
+  units.output:
+    type: "string"
+    options: ["kmh", "mph", "mps"]
+    description: "output units for overlays and sinks"
+  raw_speed.min_dt_s:
+    type: "float"
+    range: ">= 0.01"
+    description: "minimum time between dots to compute speed"
+  raw_speed.max_dt_s:
+    type: "float"
+    range: ">= raw_speed.min_dt_s"
+    description: "maximum time between dots to compute speed"
+  raw_speed.min_displacement_m:
+    type: "float"
+    range: ">= 0.0"
+    description: "distance threshold under which speed becomes 0"
+  raw_speed.min_speed_mps:
+    type: "float"
+    range: ">= 0.0"
+    description: "speed threshold under which speed becomes 0"
+  dots.min_distance_m:
+    type: "float"
+    range: "0.3 to 0.6"
+    description: "minimum displacement to add a new dot"
+  dots.min_dt_s:
+    type: "float"
+    range: "0.2 to 0.4"
+    description: "minimum time gap to add a new dot"
+  dots.buffer_size:
+    type: "int"
+    range: "4 to 6"
+    description: "dot FIFO length for turning computation"
+  turning.max_turn_rate_deg_per_s:
+    type: "float"
+    range: ">= 0.0"
+    description: "caps angular change per second for stability"
+  turning.theta_min_deg:
+    type: "float"
+    range: ">= 0.0"
+    description: "minimum turn angle used for limiting and display"
+  turning.curvature_min_1pm:
+    type: "float"
+    range: ">= 0.0"
+    description: "minimum curvature used for limiting and display"
+  turning.min_arc_len_m:
+    type: "float"
+    range: ">= 0.0"
+    description: "minimum arc length to apply turn-based limiting"
+  turning.persist_s:
+    type: "float"
+    range: ">= 0.0"
+    description: "turn persistence window for limiting and display"
+  turn_speed_limit.enabled:
+    type: "bool"
+    options: [true, false]
+    description: "enables turn-aware speed limiting"
+  turn_speed_limit.mode:
+    type: "string"
+    options: ["curvature", "linear_angle"]
+    description: "curvature uses lateral acceleration; linear_angle uses angle ratio"
+  turn_speed_limit.a_lat_max_mps2:
+    type: "float"
+    range: ">= 0.0"
+    description: "maximum lateral acceleration for curvature limiting"
+  turn_speed_limit.v_max_kmh:
+    type: "float"
+    range: "> 0.0"
+    description: "upper speed cap in km/h"
+  turn_speed_limit.v_min_kmh:
+    type: "float"
+    range: ">= 0.0"
+    description: "lower speed cap in km/h when turning"
+  turn_speed_limit.angle_max_deg:
+    type: "float"
+    range: ">= 0.0"
+    description: "maximum angle used by linear_angle mode"
+  turn_speed_limit.alpha:
+    type: "float"
+    range: "0.0 to 1.0"
+    description: "blend between raw and turn-limited speed"
+  accel_limit.enabled:
+    type: "bool"
+    options: [true, false]
+    description: "enables longitudinal acceleration limiting"
+  accel_limit.a_max_mps2:
+    type: "float"
+    range: ">= 0.0"
+    description: "maximum longitudinal acceleration"
+  smoothing.method:
+    type: "string"
+    options: ["ema"]
+    description: "speed-only smoothing method"
+  smoothing.ema_alpha:
+    type: "float"
+    range: "0.0 to 1.0"
+    description: "EMA weight for speed smoothing"
+  smoothing.max_gap_s:
+    type: "float"
+    range: ">= 0.0"
+    description: "resets EMA if gap exceeds this"
+  position_smoothing.enabled:
+    type: "bool"
+    options: [true, false]
+    description: "enables optional image-space position smoothing"
+  position_smoothing.method:
+    type: "string"
+    options: ["ema", "poly"]
+    description: "position smoothing method when enabled"
+  position_smoothing.window:
+    type: "int"
+    range: ">= 3"
+    description: "window length for poly smoothing"
+  position_smoothing.poly_degree:
+    type: "int"
+    range: ">= 1"
+    description: "polynomial degree for poly smoothing"
+  position_smoothing.ema_alpha:
+    type: "float"
+    range: "0.0 to 1.0"
+    description: "EMA weight for position smoothing"
+  position_smoothing.max_gap_s:
+    type: "float"
+    range: ">= 0.0"
+    description: "resets position smoother if gap exceeds this"
+  ablations.disable_turn_limit:
+    type: "bool"
+    options: [true, false]
+    description: "forces turn limit off"
+  ablations.disable_accel_limit:
+    type: "bool"
+    options: [true, false]
+    description: "forces accel limit off"
+  ablations.disable_smoothing:
+    type: "bool"
+    options: [true, false]
+    description: "forces speed smoothing off"
+
+mode: "advanced"
+
+units:
+  output: "kmh"
+
+raw_speed:
+  min_dt_s: 0.05
+  max_dt_s: 1.0
+  min_displacement_m: 0.20
+  min_speed_mps: 0.10
+
+dots:
+  min_distance_m: 0.50
+  min_dt_s: 0.30
+  buffer_size: 5
+
+turning:
+  max_turn_rate_deg_per_s: 180.0
+  theta_min_deg: 3.0
+  curvature_min_1pm: 0.003
+  min_arc_len_m: 0.08
+  persist_s: 0.30
+
+turn_speed_limit:
+  enabled: true
+  mode: "curvature"
+  a_lat_max_mps2: 2.5
+  v_max_kmh: 150.0
+  v_min_kmh: 30.0
+  angle_max_deg: 60.0
+  alpha: 0.5
+
+accel_limit:
+  enabled: true
+  a_max_mps2: 50.0
+
+smoothing:
+  method: "ema"
+  ema_alpha: 0.25
+  max_gap_s: 1.0
+
+position_smoothing:
+  enabled: false
+  method: "ema"
+  window: 8
+  poly_degree: 2
+  ema_alpha: 0.2
+  max_gap_s: 1.0
+
+ablations:
+  disable_turn_limit: false
+  disable_accel_limit: false
+  disable_smoothing: false
