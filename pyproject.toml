@@ -11,7 +11,7 @@ requires-python = ">=3.9"
 dependencies = [
   "numpy>=1.23",
   "PyYAML>=6.0",
-  "opencv-python-headless>=4.8",
+  # "opencv-python-headless>=4.8",  # Comment out for Jetson - use system opencv-python instead
 ]
 
 [project.optional-dependencies]
@@ -24,6 +24,13 @@ viz = [
 yolo = [
   "ultralytics>=8.0.0",
 ]
+# Jetson-specific dependencies (uncomment when deploying on Jetson)
+# jetson = [
+#   "torch>=2.0.0+cu118",  # CUDA 11.8 for Jetson
+#   "torchvision>=0.15.0+cu118",
+#   "onnxruntime-gpu>=1.15.0",  # GPU acceleration
+#   "tensorrt>=8.5.0",  # TensorRT for optimized inference
+# ]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
