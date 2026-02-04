@@ -72,7 +72,7 @@ class _FfmpegReader:
         try:
             popen_kwargs = {
                 "stdout": subprocess.PIPE,
-                "stderr": subprocess.DEVNULL,
+                "stderr": subprocess.PIPE,
                 "stdin": subprocess.DEVNULL,
                 "bufsize": 0,
             }
@@ -92,11 +92,23 @@ class _FfmpegReader:
     def read(self) -> Optional[np.ndarray]:
         if self._proc is None or self._proc.stdout is None:
             return None
-        raw = self._proc.stdout.read(self._frame_bytes)
-        if raw is None or len(raw) != self._frame_bytes:
+        
+        try:
+            raw = self._proc.stdout.read(self._frame_bytes)
+            if raw is None or len(raw) != self._frame_bytes:
+                # Process might have exited or stream ended
+                if self._proc.poll() is not None:
+                    err_bytes = self._proc.stderr.read() if self._proc.stderr else b""
+                    if err_bytes:
+                        err_msg = err_bytes.decode("utf-8", errors="replace").strip()
+                        logger.error(f"FFmpeg process exited. Error output: {err_msg}")
+                return None
+            
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3))
+            return frame
+        except Exception as e:
+            logger.error(f"Error reading from FFmpeg: {e}")
             return None
-        frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3))
-        return frame
 
     def close(self) -> None:
         if self._proc is None:
