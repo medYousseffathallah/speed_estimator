@@ -1,0 +1,36 @@
+{
+  "rtsp_url": "rtsp://admin:admin@192.168.1.164:8554/live",
+  "camera_id": "normanniles",
+  "runtime": {
+    "resize": { "enabled": true, "width": 1280, "height": 720 },
+    "fps_hint": 30.0
+  },
+  "calibration": {
+    "homography_npy": "C:\\Users\\youss\\OneDrive\\Desktop\\youssef\\speedestimation_version2\\calibration\\rtsp_camera_192_168_1_17_H.npy"
+  },
+  "detection": {
+    "enabled": true,
+    "model_path": "yolov8n.pt",
+    "conf": 0.25,
+    "iou": 0.7,
+    "classes": [1, 2, 3, 5, 7]
+  },
+  "output": {
+    "event_clipping": {
+      "enabled": false,
+      "output_dir": "outputs/clips",
+      "db_path": "outputs/events.sqlite",
+      "pre_s": 5.0,
+      "post_s": 5.0,
+      "cooldown_s": 15.0,
+      "min_consecutive_samples": 3,
+      "min_duration_s": 0.25,
+      "max_gap_s": 0.0,
+      "speed_limit_kmh": 50.0,
+      "angle_min_deg": 15.0,
+      "angle_speed_limit_kmh": 30.0,
+
+      "fps": 30.0
+    }
+  }
+}
