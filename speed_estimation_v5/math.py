@@ -630,6 +630,9 @@ class SpeedEstimator:
             return ()
         return tuple(h.dots)
 
+    def reset(self) -> None:
+        self._hist.clear()
+
     def update(self, tracks: List[Track]) -> List[SpeedSample]:
         out: List[SpeedSample] = []
         for tr in tracks:

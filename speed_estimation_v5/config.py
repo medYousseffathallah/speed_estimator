@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import copy
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -48,9 +49,35 @@ def _env_str(key: str, default: str = "") -> str:
     return v if v != "" else str(default)
 
 
+_ENV_BRACE_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _expand_env_str(s: str) -> str:
+    s2 = os.path.expandvars(str(s))
+    def repl(m: re.Match[str]) -> str:
+        return str(os.environ.get(m.group(1), "") or "")
+    s2 = _ENV_BRACE_RE.sub(repl, s2)
+    return os.path.expandvars(s2)
+
+
+def _expand_env(obj: Any) -> Any:
+    if isinstance(obj, str):
+        return _expand_env_str(obj)
+    if isinstance(obj, dict):
+        return {k: _expand_env(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_expand_env(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_expand_env(v) for v in obj)
+    return obj
+
+
 def _load_json(path: str) -> JsonDict:
     with open(path, "r", encoding="utf-8") as f:
-        return dict(json.load(f))
+        data = json.load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected a dict at root of JSON config: {path}")
+    return dict(_expand_env(data))
 
 
 def _resolve_path(p: str, base_dir: Optional[str]) -> str:

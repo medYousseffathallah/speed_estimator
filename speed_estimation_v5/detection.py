@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -7,6 +8,9 @@ import numpy as np
 
 
 JsonDetection = Dict[str, Any]
+
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_path(path: str, base_dir: Optional[str]) -> str:
@@ -56,7 +60,11 @@ class YoloV8Detector:
             from ultralytics import YOLO  # type: ignore
         except Exception as e:  # pragma: no cover
             raise RuntimeError("Ultralytics is required for YOLOv8 detection (pip install ultralytics)") from e
+        logger.info("Loading YOLO model", extra={"model_path": self._model_path, "device": self._device or ""})
         self._model = YOLO(self._model_path)
+
+    def warmup(self) -> None:
+        self._ensure_loaded()
 
     def detect(self, frame_bgr: np.ndarray) -> List[JsonDetection]:
         self._ensure_loaded()

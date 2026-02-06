@@ -3,13 +3,19 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import logging.handlers
+import math
 import os
 from pathlib import Path
 import sqlite3
+import shutil
+import signal
+import subprocess
 import sys
 import time
 import traceback
 import csv
+import urllib.parse
 from collections import deque
 import threading
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
@@ -34,6 +40,121 @@ except ModuleNotFoundError:
 JsonDict = Dict[str, Any]
 
 
+logger = logging.getLogger(__name__)
+
+
+class _JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload: Dict[str, Any] = {
+            "ts": self.formatTime(record, datefmt="%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+
+        reserved = {
+            "name",
+            "msg",
+            "args",
+            "levelname",
+            "levelno",
+            "pathname",
+            "filename",
+            "module",
+            "exc_info",
+            "exc_text",
+            "stack_info",
+            "lineno",
+            "funcName",
+            "created",
+            "msecs",
+            "relativeCreated",
+            "thread",
+            "threadName",
+            "processName",
+            "process",
+        }
+        for k, v in record.__dict__.items():
+            if k in reserved or k.startswith("_"):
+                continue
+            try:
+                json.dumps(v)
+                payload[k] = v
+            except Exception:
+                payload[k] = str(v)
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
+
+
+def configure_logging(
+    *,
+    level: str = "INFO",
+    fmt: str = "text",
+    file_path: str = "",
+    rotate_mb: float = 0.0,
+    backup_count: int = 5,
+) -> None:
+    level_name = str(level or "INFO").upper()
+    log_level = getattr(logging, level_name, logging.INFO)
+
+    handlers: List[logging.Handler] = []
+    if str(file_path or "").strip() != "":
+        rotate_bytes = int(float(rotate_mb) * 1024.0 * 1024.0)
+        if rotate_bytes > 0:
+            handlers.append(
+                logging.handlers.RotatingFileHandler(
+                    str(file_path),
+                    encoding="utf-8",
+                    maxBytes=int(rotate_bytes),
+                    backupCount=max(0, int(backup_count)),
+                )
+            )
+        else:
+            handlers.append(logging.FileHandler(str(file_path), encoding="utf-8"))
+    handlers.append(logging.StreamHandler())
+
+    use_json = str(fmt or "text").strip().lower() == "json"
+    if use_json:
+        formatter: logging.Formatter = _JsonFormatter()
+    else:
+        formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    for h in handlers:
+        h.setFormatter(formatter)
+
+    root = logging.getLogger()
+    root.setLevel(log_level)
+    root.handlers.clear()
+    for h in handlers:
+        root.addHandler(h)
+
+
+def _redact_source(source: CameraSource) -> str:
+    if isinstance(source, int):
+        return f"webcam:{int(source)}"
+    s = str(source)
+    s_strip = s.strip()
+    if s_strip == "":
+        return ""
+    if os.path.exists(s_strip):
+        try:
+            p = Path(s_strip)
+            return str(p)
+        except Exception:
+            return "<file>"
+    try:
+        u = urllib.parse.urlsplit(s_strip)
+    except Exception:
+        return "<source>"
+    if str(u.scheme).lower() in {"rtsp", "rtsps", "http", "https"}:
+        netloc = u.netloc
+        if "@" in netloc:
+            _userinfo, hostport = netloc.rsplit("@", 1)
+            netloc = "<redacted>@" + hostport
+        return urllib.parse.urlunsplit((u.scheme, netloc, u.path, u.query, ""))
+    return "<source>"
+
+
 def _bbox_anchor_bottom_center_xy(bbox_xyxy: Tuple[float, float, float, float]) -> Tuple[float, float]:
     x1, y1, x2, y2 = bbox_xyxy
     return (0.5 * (float(x1) + float(x2)), float(y2))
@@ -54,6 +175,27 @@ def _detection_from_json(obj: Mapping[str, Any]) -> motion_math.Detection:
         class_id=int(obj.get("class_id", 0)),
         class_name=str(obj.get("class_name", "")),
     )
+
+
+def _is_valid_bbox_xyxy(bbox_xyxy: Tuple[float, float, float, float]) -> bool:
+    x1, y1, x2, y2 = bbox_xyxy
+    if not (np.isfinite(x1) and np.isfinite(y1) and np.isfinite(x2) and np.isfinite(y2)):
+        return False
+    if float(x2) <= float(x1) or float(y2) <= float(y1):
+        return False
+    return True
+
+
+def _try_detection_from_json(obj: Any) -> Optional[motion_math.Detection]:
+    if not isinstance(obj, Mapping):
+        return None
+    try:
+        d = _detection_from_json(obj)
+    except Exception:
+        return None
+    if not _is_valid_bbox_xyxy(d.bbox_xyxy):
+        return None
+    return d
 
 
 def _detections_from_json(seq: Sequence[Mapping[str, Any]]) -> List[motion_math.Detection]:
@@ -196,6 +338,8 @@ class SpeedEstimationPipelineV5:
 
     def __init__(self, cfg: V5PipelineConfig) -> None:
         self._cfg = cfg
+        self._logger = logging.getLogger(f"{__name__}.pipeline")
+        self._closed = False
         self._mapping = WorldMapping.from_config(cfg.calibration, base_dir=cfg.base_dir)
 
         runtime_cfg = dict(cfg.runtime or {})
@@ -273,8 +417,29 @@ class SpeedEstimationPipelineV5:
 
         self._latest_sample_by_track: Dict[int, Any] = {}
 
+    def __enter__(self) -> "SpeedEstimationPipelineV5":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc: Optional[BaseException],
+        tb: Optional[Any],
+    ) -> None:
+        self.shutdown()
+
+    def warmup(self) -> None:
+        if self._detector is not None:
+            self._detector.warmup()
+
+    def shutdown(self) -> None:
+        if self._closed:
+            return
+        self.reset()
+        self._closed = True
+
     def reset(self) -> None:
-        self._estimator.prune_missing([])
+        self._estimator.reset()
         if self._tracker is not None:
             self._tracker.reset()
         if self._legacy_tracker is not None:
@@ -283,6 +448,9 @@ class SpeedEstimationPipelineV5:
 
                 self._legacy_tracker = create_tracker(self._legacy_tracker_backend, dict(self._legacy_tracker_params))
         self._latest_sample_by_track.clear()
+
+    def pixel_to_world(self, xy_px: Tuple[float, float]) -> Optional[Tuple[float, float]]:
+        return self._mapping.pixel_to_world(xy_px)
 
     def process_frame(
         self,
@@ -460,7 +628,29 @@ class SpeedEstimationPipelineV5:
             dets = None
             if detections_by_frame is not None:
                 dets = detections_by_frame.get(int(frame_index))
-            yield self.process_frame(frame_index=int(frame_index), timestamp_s=float(t_s), frame_bgr=frame_bgr, detections=dets)
+            # Critical behavior: if a frame fails mid-processing, reset state to avoid partial updates.
+            try:
+                yield self.process_frame(
+                    frame_index=int(frame_index),
+                    timestamp_s=float(t_s),
+                    frame_bgr=frame_bgr,
+                    detections=dets,
+                )
+            except Exception:
+                self._logger.error(
+                    "process_frame_failed: returning empty frame output",
+                    exc_info=True,
+                    extra={"camera_id": str(self._cfg.camera_id), "frame_index": int(frame_index)},
+                )
+                self.reset()
+                yield {
+                    "camera_id": str(self._cfg.camera_id),
+                    "frame_index": int(frame_index),
+                    "timestamp_s": float(t_s),
+                    "tracks": [],
+                    "num_detections": 0,
+                    "num_tracks": 0,
+                }
 
     def _get_detections(
         self,
@@ -475,14 +665,68 @@ class SpeedEstimationPipelineV5:
                 return []
             first = detections[0]
             if isinstance(first, motion_math.Detection):
-                return _sort_detections(list(detections))  # type: ignore[arg-type]
-            return _sort_detections(_detections_from_json(detections))  # type: ignore[arg-type]
+                out: List[motion_math.Detection] = []
+                for d in detections:  # type: ignore[assignment]
+                    if isinstance(d, motion_math.Detection) and _is_valid_bbox_xyxy(d.bbox_xyxy):
+                        out.append(d)
+                return _sort_detections(out)
+
+            parsed: List[motion_math.Detection] = []
+            for idx, obj in enumerate(detections):  # type: ignore[assignment]
+                d = _try_detection_from_json(obj)
+                if d is None:
+                    self._logger.warning(
+                        "malformed_detection_dropped",
+                        extra={"camera_id": str(self._cfg.camera_id), "frame_index": int(frame_index), "det_index": int(idx)},
+                    )
+                    continue
+                parsed.append(d)
+            return _sort_detections(parsed)
         if self._detector is None:
             return []
         if frame_bgr is None:
-            raise ValueError("frame_bgr is required when detections are not provided")
-        det_json = self._detector.detect(frame_bgr)
-        return _sort_detections(_detections_from_json(det_json))
+            self._logger.error(
+                "missing_frame_bgr: detector enabled but no frame provided",
+                extra={"camera_id": str(self._cfg.camera_id), "frame_index": int(frame_index)},
+            )
+            return []
+        try:
+            det_json = self._detector.detect(frame_bgr)
+        except RuntimeError as e:
+            msg = str(e)
+            msg_l = msg.lower()
+            if "out of memory" in msg_l or ("cuda" in msg_l and "memory" in msg_l):
+                try:
+                    import torch  # type: ignore
+
+                    if hasattr(torch, "cuda"):
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                self._logger.error(
+                    "gpu_oom_detected: skipping detections",
+                    extra={"camera_id": str(self._cfg.camera_id), "frame_index": int(frame_index)},
+                )
+                return []
+            self._logger.error(
+                "detector_failed: returning empty detections",
+                exc_info=True,
+                extra={"camera_id": str(self._cfg.camera_id), "frame_index": int(frame_index)},
+            )
+            return []
+        except Exception:
+            self._logger.error(
+                "detector_failed: returning empty detections",
+                exc_info=True,
+                extra={"camera_id": str(self._cfg.camera_id), "frame_index": int(frame_index)},
+            )
+            return []
+        parsed = []
+        for obj in det_json:
+            d = _try_detection_from_json(obj)
+            if d is not None:
+                parsed.append(d)
+        return _sort_detections(parsed)
 
     def _tracks_to_world_tracks(
         self, tracks: Sequence[motion_math.TrackState], *, frame_index: int, timestamp_s: float
@@ -508,6 +752,7 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--config", type=str, default="", help="Path to a JSON config file")
     p.add_argument("--window", type=str, default="v5 overlay", help="OpenCV window name")
     p.add_argument("--verbose", action="store_true", help="Enable verbose logs")
+    p.add_argument("--healthcheck", action="store_true", help="Validate config and environment then exit")
     p.add_argument("--no-traj", action="store_true", help="Disable drawing trajectory dots")
     p.add_argument("--traj-len", type=int, default=40, help="Max trajectory dots per track")
     p.add_argument("--no-vector", action="store_true", help="Disable drawing last motion vector")
@@ -544,6 +789,7 @@ class _ThreadedFrameGrabber:
         self._buffer_size = int(buffer_size)
         self._target_fps = float(target_fps)
         self._pace = isinstance(self._source, str) and os.path.exists(str(self._source))
+        self._logger = logging.getLogger(f"{__name__}.grabber")
         self._lock = threading.Lock()
         self._last_frame: Optional[np.ndarray] = None
         self._last_frame_t_s: Optional[float] = None
@@ -557,22 +803,24 @@ class _ThreadedFrameGrabber:
         if self._thread is not None:
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="rtsp-grabber", daemon=True)
+        self._thread = threading.Thread(target=self._run, name=f"rtsp-grabber-{id(self)}", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
-        t = self._thread
-        if t is not None:
-            t.join(timeout=1.0)
-        self._thread = None
-        cap = self._cap
-        self._cap = None
+        cap = None
+        with self._lock:
+            cap = self._cap
+            self._cap = None
         if cap is not None:
             try:
                 cap.release()
             except Exception:
                 pass
+        t = self._thread
+        if t is not None:
+            t.join(timeout=2.0)
+        self._thread = None
 
     def reset(self) -> None:
         with self._lock:
@@ -588,12 +836,23 @@ class _ThreadedFrameGrabber:
     def _run(self) -> None:
         import cv2
 
+        last_open_warn_t = 0.0
         while not self._stop.is_set():
-            cap = _open_capture(self._source)
-            if cap is None:
+            try:
+                cap = _open_capture(self._source)
+            except Exception:
+                self._logger.error("open_capture_failed", exc_info=True, extra={"source": _redact_source(self._source)})
                 time.sleep(0.5)
                 continue
-            self._cap = cap
+            if cap is None:
+                now = time.time()
+                if (now - last_open_warn_t) >= 5.0:
+                    self._logger.warning("open_capture_returned_none", extra={"source": _redact_source(self._source)})
+                    last_open_warn_t = now
+                time.sleep(0.5)
+                continue
+            with self._lock:
+                self._cap = cap
 
             if self._pace:
                 fps = cap.get(cv2.CAP_PROP_FPS)
@@ -623,7 +882,11 @@ class _ThreadedFrameGrabber:
                         if elapsed < self._frame_interval_s:
                             time.sleep(self._frame_interval_s - elapsed)
 
-                    ok, frame = cap.read()
+                    try:
+                        ok, frame = cap.read()
+                    except Exception:
+                        self._logger.error("capture_read_failed", exc_info=True, extra={"source": _redact_source(self._source)})
+                        break
                     if not ok or frame is None:
                         break
                     last_read_time = time.time()
@@ -635,7 +898,9 @@ class _ThreadedFrameGrabber:
                     cap.release()
                 except Exception:
                     pass
-                self._cap = None
+                with self._lock:
+                    if self._cap is cap:
+                        self._cap = None
             time.sleep(0.1)
 
 
@@ -671,168 +936,325 @@ def run_rtsp_overlay(
         if rtsp_url == "":
             raise SystemExit("Missing camera source.")
 
-    logger.info("Opening source: %s", rtsp_url)
+    logger.info("Opening source: %s", _redact_source(rtsp_url))
+
+    p: Optional[SpeedEstimationPipelineV5] = None
+    grabber: Optional[_ThreadedFrameGrabber] = None
+    exporter: Optional[_ExportWriter] = None
+    clipper: Optional[_EventClipper] = None
+    shutdown_requested = False
+
+    def _handle_signal(_signum, _frame) -> None:
+        nonlocal shutdown_requested
+        shutdown_requested = True
 
     try:
+        try:
+            signal.signal(signal.SIGINT, _handle_signal)
+        except Exception:
+            pass
+        try:
+            signal.signal(signal.SIGTERM, _handle_signal)
+        except Exception:
+            pass
+
         p = SpeedEstimationPipelineV5(cfg)
-    except Exception:
-        logger.error("Failed to initialize pipeline:\n%s", traceback.format_exc())
-        raise
+        try:
+            p.warmup()
+        except Exception:
+            logger.error("Pipeline warmup failed:\n%s", traceback.format_exc())
+            raise
 
-    speed_cfg = dict(getattr(cfg, "speed", {}) or {})
-    dots_cfg = dict(speed_cfg.get("dots", {}) or {})
-    dot_min_distance_m = float(dots_cfg.get("min_distance_m", 0.8))
-    dot_min_dt_s = float(dots_cfg.get("min_dt_s", 0.5))
+        speed_cfg = dict(getattr(cfg, "speed", {}) or {})
+        dots_cfg = dict(speed_cfg.get("dots", {}) or {})
+        dot_min_distance_m = float(dots_cfg.get("min_distance_m", 0.8))
+        dot_min_dt_s = float(dots_cfg.get("min_dt_s", 0.5))
 
-    runtime_cfg = dict(getattr(cfg, "runtime", {}) or {})
-    fps_hint = float(runtime_cfg.get("fps_hint", 0.0) or 0.0)
+        runtime_cfg = dict(getattr(cfg, "runtime", {}) or {})
+        fps_hint = float(runtime_cfg.get("fps_hint", 0.0) or 0.0)
 
-    if buffer_size is None:
-        buffer_size = int(runtime_cfg.get("buffer_size", 1))
-    if read_timeout_s is None:
-        read_timeout_s = float(runtime_cfg.get("read_timeout_s", 2.0))
-    if reconnect_delay_s is None:
-        reconnect_delay_s = float(runtime_cfg.get("reconnect_delay_s", 2.0))
+        if buffer_size is None:
+            buffer_size = int(runtime_cfg.get("buffer_size", 1))
+        if read_timeout_s is None:
+            read_timeout_s = float(runtime_cfg.get("read_timeout_s", 2.0))
+        if reconnect_delay_s is None:
+            reconnect_delay_s = float(runtime_cfg.get("reconnect_delay_s", 2.0))
 
-    grabber = _ThreadedFrameGrabber(source=rtsp_url, buffer_size=int(buffer_size), target_fps=fps_hint)
-    grabber.start()
+        grabber = _ThreadedFrameGrabber(source=rtsp_url, buffer_size=int(buffer_size), target_fps=fps_hint)
+        grabber.start()
 
-    exporter = _ExportWriter.from_config(export_cfg) if export_cfg else None
-    clipper = _EventClipper.from_config(event_cfg, camera_id=str(cfg.camera_id), fps_hint=fps_hint) if event_cfg else None
+        exporter = _ExportWriter.from_config(export_cfg) if export_cfg else None
+        clipper = _EventClipper.from_config(event_cfg, camera_id=str(cfg.camera_id), fps_hint=fps_hint) if event_cfg else None
 
-    traj_len = max(2, int(traj_len))
-    history_px_by_track: Dict[int, "deque[Tuple[int, int, float, float, float]]"] = {}
+        traj_len = max(2, int(traj_len))
+        history_px_by_track: Dict[int, "deque[Tuple[int, int, float, float, float]]"] = {}
 
-    t0_frame_t_s: Optional[float] = None
-    frame_index = 0
-    consecutive_failures = 0
-    while True:
-        frame, frame_t_s = grabber.get_latest()
-        now = time.time()
-        if frame is None or frame_t_s is None:
-            consecutive_failures += 1
-            if consecutive_failures == 1:
-                logger.warning("Waiting for frames...")
-            time.sleep(0.02)
-            continue
-
-        if (now - float(frame_t_s)) > float(read_timeout_s):
-            consecutive_failures += 1
-            logger.warning("RTSP stalled (no new frames for %.2fs).", now - float(frame_t_s))
-            if reconnect and consecutive_failures >= int(max_consecutive_read_failures):
-                logger.warning("Restarting grabber after %d stalled checks...", consecutive_failures)
-                grabber.stop()
-                time.sleep(max(0.0, float(reconnect_delay_s)))
-                grabber = _ThreadedFrameGrabber(source=rtsp_url, buffer_size=int(buffer_size), target_fps=fps_hint)
-                grabber.start()
-                consecutive_failures = 0
-            time.sleep(0.02)
-            continue
-
+        t0_frame_t_s: Optional[float] = None
+        frame_index = 0
         consecutive_failures = 0
+        last_processed_frame_t_s: Optional[float] = None
+        expected_interval_s = 0.0
+        if fps_hint > 0.0:
+            expected_interval_s = 1.0 / float(fps_hint)
+        dropped_frames_total = 0
+        dropped_frames_since_log = 0
+        max_drop_dt_s = 0.0
+        stall_checks_since_log = 0
+        last_drop_log_wall_s = 0.0
+        last_stats_log_wall_s = 0.0
+        last_stall_log_wall_s = 0.0
+        processed_frames_since_log = 0
 
-        if t0_frame_t_s is None:
-            t0_frame_t_s = float(frame_t_s)
-        t_s = float(frame_t_s) - float(t0_frame_t_s)
+        runtime_log_cfg = dict(runtime_cfg.get("logging", {}) or {})
+        runtime_log_enabled = bool(runtime_log_cfg.get("enabled", False))
+        stats_interval_s = float(runtime_log_cfg.get("stats_interval_s", 10.0))
+        drops_interval_s = float(runtime_log_cfg.get("drops_interval_s", 10.0))
+        if not runtime_log_enabled:
+            stats_interval_s = 0.0
+            drops_interval_s = 0.0
+        else:
+            stats_interval_s = max(1.0, float(stats_interval_s))
+            drops_interval_s = max(1.0, float(drops_interval_s))
+        while not shutdown_requested:
+            frame, frame_t_s = grabber.get_latest()
+            now = time.time()
+            if frame is None or frame_t_s is None:
+                consecutive_failures += 1
+                if consecutive_failures == 1:
+                    logger.warning("Waiting for frames...")
+                time.sleep(0.02)
+                continue
 
-        try:
-            out = p.process_frame(frame_index=frame_index, timestamp_s=t_s, frame_bgr=frame, detections=None)
-        except Exception:
-            logger.error("Pipeline error at frame_index=%d:\n%s", frame_index, traceback.format_exc())
-            time.sleep(0.05)
-            frame_index += 1
-            continue
+            if last_processed_frame_t_s is not None and float(frame_t_s) == float(last_processed_frame_t_s):
+                time.sleep(0.001)
+                continue
 
-        if exporter is not None:
+            if last_processed_frame_t_s is not None and expected_interval_s > 0.0:
+                dt = float(frame_t_s) - float(last_processed_frame_t_s)
+                if runtime_log_enabled and dt > (1.5 * float(expected_interval_s)):
+                    missed = int(round(dt / float(expected_interval_s))) - 1
+                    if missed > 0:
+                        dropped_frames_total += int(missed)
+                        dropped_frames_since_log += int(missed)
+                        if float(dt) > float(max_drop_dt_s):
+                            max_drop_dt_s = float(dt)
+                        if (now - float(last_drop_log_wall_s)) >= float(drops_interval_s):
+                            extra: Dict[str, Any] = {
+                                "camera_id": str(getattr(cfg, "camera_id", "")),
+                                "buffer": "frame_grabber",
+                                "drop_reason": "consumer_lag",
+                                "dropped": int(dropped_frames_since_log),
+                                "dropped_total": int(dropped_frames_total),
+                                "max_dt_s": float(max_drop_dt_s),
+                                "expected_interval_s": float(expected_interval_s),
+                                "window_s": float(drops_interval_s),
+                            }
+                            if clipper is not None:
+                                extra["event_prebuffer_occupancy"] = int(len(clipper._pre_buf))
+                                extra["event_prebuffer_limit"] = int(clipper._pre_buf_max_frames)
+                            logger.warning("frame_drop_summary", extra=extra)
+                            last_drop_log_wall_s = float(now)
+                            dropped_frames_since_log = 0
+                            max_drop_dt_s = 0.0
+
+            last_processed_frame_t_s = float(frame_t_s)
+
+            if (now - float(frame_t_s)) > float(read_timeout_s):
+                consecutive_failures += 1
+                stall_checks_since_log += 1
+                if runtime_log_enabled and (now - float(last_stall_log_wall_s)) >= 5.0:
+                    logger.warning(
+                        "rtsp_stalled",
+                        extra={
+                            "camera_id": str(getattr(cfg, "camera_id", "")),
+                            "stalled_for_s": float(now - float(frame_t_s)),
+                            "consecutive_failures": int(consecutive_failures),
+                        },
+                    )
+                    last_stall_log_wall_s = float(now)
+                if reconnect and consecutive_failures >= int(max_consecutive_read_failures):
+                    logger.warning("Restarting grabber after %d stalled checks...", consecutive_failures)
+                    grabber.stop()
+                    time.sleep(max(0.0, float(reconnect_delay_s)))
+                    grabber = _ThreadedFrameGrabber(source=rtsp_url, buffer_size=int(buffer_size), target_fps=fps_hint)
+                    grabber.start()
+                    consecutive_failures = 0
+                time.sleep(0.02)
+                continue
+
+            consecutive_failures = 0
+            if runtime_log_enabled:
+                processed_frames_since_log += 1
+
+            if t0_frame_t_s is None:
+                t0_frame_t_s = float(frame_t_s)
+            t_s = float(frame_t_s) - float(t0_frame_t_s)
+
             try:
-                exporter.write(out)
-            except Exception:
-                logger.error("Export error:\n%s", traceback.format_exc())
-                exporter.close()
-                exporter = None
-        if clipper is not None:
-            try:
-                clipper.update(frame_bgr=frame, out=out)
-            except Exception:
-                logger.error("Event clipper error:\n%s", traceback.format_exc())
-                clipper.close()
-                clipper = None
-
-        alive_ids: set[int] = set()
-        for tr in out["tracks"]:
-            tid = int(tr["track_id"])
-            alive_ids.add(tid)
-            x1, y1, x2, y2 = [int(v) for v in tr["bbox_xyxy"]]
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-            if draw_traj or draw_vector:
-                ax = int(round(0.5 * (x1 + x2)))
-                ay = int(round(y2))
-                t_s = float(out.get("timestamp_s", 0.0))
-                w = p._mapping.pixel_to_world((float(ax), float(ay)))
-                wx = float(w[0]) if w is not None else float("nan")
-                wy = float(w[1]) if w is not None else float("nan")
-                h = history_px_by_track.get(tid)
-                if h is None:
-                    h = deque(maxlen=traj_len)
-                    history_px_by_track[tid] = h
-                add = False
-                if not h:
-                    add = True
-                else:
-                    last_px, last_py, last_wx, last_wy, last_t = h[-1]
-                    dt = float(t_s - last_t)
-                    if dt > 0.0:
-                        if np.isfinite(wx) and np.isfinite(wy) and np.isfinite(last_wx) and np.isfinite(last_wy):
-                            dx = float(wx - last_wx)
-                            dy = float(wy - last_wy)
-                            dist = (dx * dx + dy * dy) ** 0.5
-                            if dist >= dot_min_distance_m and dt >= dot_min_dt_s:
-                                add = True
-                        else:
-                            dpx = float(ax - last_px)
-                            dpy = float(ay - last_py)
-                            dist_px = (dpx * dpx + dpy * dpy) ** 0.5
-                            if dist_px >= 1.0 and dt >= dot_min_dt_s:
-                                add = True
-                if add:
-                    h.append((ax, ay, wx, wy, t_s))
-                if draw_traj:
-                    pts = list(h)
-                    for px, py, _wx, _wy, _t in pts:
-                        cv2.circle(frame, (int(px), int(py)), 2, (0, 200, 255), -1)
-                if draw_vector and len(h) >= 2:
-                    (p0x, p0y, _w0x, _w0y, _t0) = h[-2]
-                    (p1x, p1y, _w1x, _w1y, _t1) = h[-1]
-                    if p0x != p1x or p0y != p1y:
-                        cv2.arrowedLine(frame, (int(p0x), int(p0y)), (int(p1x), int(p1y)), (255, 0, 0), 2, tipLength=0.3)
-
-            sp_kmh = float(tr["speed"]["kmh"])
-            turn = float(tr["turning"]["turn_angle_signed_deg"])
-            omega = float(tr["turning"]["angular_rate_deg_s"])
-            label = f"id={tr['track_id']} {tr['class_name']} {sp_kmh:.1f}km/h turn={turn:.1f} w={omega:.1f}"
-            cv2.putText(frame, label, (x1, max(0, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-        if history_px_by_track:
-            to_del = [tid for tid in history_px_by_track.keys() if int(tid) not in alive_ids]
-            for tid in to_del:
-                del history_px_by_track[tid]
-
-        try:
-            cv2.imshow(window_name, frame)
-            if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                out = p.process_frame(frame_index=frame_index, timestamp_s=t_s, frame_bgr=frame, detections=None)
+            except KeyboardInterrupt:
                 break
-        except Exception:
-            logger.error("OpenCV display error:\n%s", traceback.format_exc())
-            break
-        frame_index += 1
+            except Exception:
+                logger.error("Pipeline error at frame_index=%d:\n%s", frame_index, traceback.format_exc())
+                time.sleep(0.05)
+                frame_index += 1
+                continue
 
-    grabber.stop()
-    if exporter is not None:
-        exporter.close()
-    if clipper is not None:
-        clipper.close()
-    cv2.destroyAllWindows()
+            if runtime_log_enabled and (now - float(last_stats_log_wall_s)) >= float(stats_interval_s):
+                tracks = out.get("tracks", []) or []
+                max_sp = 0.0
+                max_abs_angle = 0.0
+                n_anchor_ok = 0
+                n_sample_emitted = 0
+                max_dot_count = 0
+                for tr in tracks:
+                    try:
+                        sp = float((tr.get("speed", {}) or {}).get("kmh", 0.0))
+                        if sp > max_sp:
+                            max_sp = sp
+                        ang = float((tr.get("turning", {}) or {}).get("turn_angle_signed_deg", 0.0))
+                        if abs(ang) > max_abs_angle:
+                            max_abs_angle = abs(ang)
+                        if tr.get("anchor_world_m") is not None:
+                            n_anchor_ok += 1
+                        diag = tr.get("diagnostics", {}) or {}
+                        if float(diag.get("sample_emitted", 0.0)) >= 0.5:
+                            n_sample_emitted += 1
+                        dc = int(float(diag.get("dot_count", 0.0)))
+                        if dc > max_dot_count:
+                            max_dot_count = dc
+                    except Exception:
+                        continue
+
+                logger.info(
+                    "frame_stats",
+                    extra={
+                        "camera_id": str(out.get("camera_id", "")),
+                        "frame_index": int(out.get("frame_index", 0)),
+                        "timestamp_s": float(out.get("timestamp_s", 0.0)),
+                        "num_detections": int(out.get("num_detections", 0)),
+                        "num_tracks": int(out.get("num_tracks", 0)),
+                        "tracks": int(len(tracks)),
+                        "tracks_with_anchor": int(n_anchor_ok),
+                        "samples_emitted": int(n_sample_emitted),
+                        "max_speed_kmh": float(max_sp),
+                        "max_abs_turn_deg": float(max_abs_angle),
+                        "max_dot_count": int(max_dot_count),
+                        "resize_w": int(frame.shape[1]) if hasattr(frame, "shape") else 0,
+                        "resize_h": int(frame.shape[0]) if hasattr(frame, "shape") else 0,
+                        "window_s": float(stats_interval_s),
+                        "processed_frames": int(processed_frames_since_log),
+                        "approx_fps": float(processed_frames_since_log / float(max(1e-9, stats_interval_s))),
+                        "stall_checks": int(stall_checks_since_log),
+                    },
+                )
+                last_stats_log_wall_s = float(now)
+                processed_frames_since_log = 0
+                stall_checks_since_log = 0
+
+            if exporter is not None:
+                try:
+                    exporter.write(out)
+                except Exception:
+                    logger.error("Export error:\n%s", traceback.format_exc())
+                    exporter.close()
+                    exporter = None
+            if clipper is not None:
+                try:
+                    clipper.update(frame_bgr=frame, out=out)
+                except Exception:
+                    logger.error("Event clipper error:\n%s", traceback.format_exc())
+                    clipper.close()
+                    clipper = None
+
+            alive_ids: set[int] = set()
+            for tr in out["tracks"]:
+                tid = int(tr["track_id"])
+                alive_ids.add(tid)
+                x1, y1, x2, y2 = [int(v) for v in tr["bbox_xyxy"]]
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+                if draw_traj or draw_vector:
+                    ax = int(round(0.5 * (x1 + x2)))
+                    ay = int(round(y2))
+                    t_s = float(out.get("timestamp_s", 0.0))
+                    w = p.pixel_to_world((float(ax), float(ay)))
+                    wx = float(w[0]) if w is not None else float("nan")
+                    wy = float(w[1]) if w is not None else float("nan")
+                    h = history_px_by_track.get(tid)
+                    if h is None:
+                        h = deque(maxlen=traj_len)
+                        history_px_by_track[tid] = h
+                    add = False
+                    if not h:
+                        add = True
+                    else:
+                        last_px, last_py, last_wx, last_wy, last_t = h[-1]
+                        dt = float(t_s - last_t)
+                        if dt > 0.0:
+                            if np.isfinite(wx) and np.isfinite(wy) and np.isfinite(last_wx) and np.isfinite(last_wy):
+                                dx = float(wx - last_wx)
+                                dy = float(wy - last_wy)
+                                dist = (dx * dx + dy * dy) ** 0.5
+                                if dist >= dot_min_distance_m and dt >= dot_min_dt_s:
+                                    add = True
+                            else:
+                                dpx = float(ax - last_px)
+                                dpy = float(ay - last_py)
+                                dist_px = (dpx * dpx + dpy * dpy) ** 0.5
+                                if dist_px >= 1.0 and dt >= dot_min_dt_s:
+                                    add = True
+                    if add:
+                        h.append((ax, ay, wx, wy, t_s))
+                    if draw_traj:
+                        pts = list(h)
+                        for px, py, _wx, _wy, _t in pts:
+                            cv2.circle(frame, (int(px), int(py)), 2, (0, 200, 255), -1)
+                    if draw_vector and len(h) >= 2:
+                        (p0x, p0y, _w0x, _w0y, _t0) = h[-2]
+                        (p1x, p1y, _w1x, _w1y, _t1) = h[-1]
+                        if p0x != p1x or p0y != p1y:
+                            cv2.arrowedLine(
+                                frame,
+                                (int(p0x), int(p0y)),
+                                (int(p1x), int(p1y)),
+                                (255, 0, 0),
+                                2,
+                                tipLength=0.3,
+                            )
+
+                sp_kmh = float(tr["speed"]["kmh"])
+                turn = float(tr["turning"]["turn_angle_signed_deg"])
+                omega = float(tr["turning"]["angular_rate_deg_s"])
+                label = f"id={tr['track_id']} {tr['class_name']} {sp_kmh:.1f}km/h turn={turn:.1f} w={omega:.1f}"
+                cv2.putText(frame, label, (x1, max(0, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+            if history_px_by_track:
+                to_del = [tid for tid in history_px_by_track.keys() if int(tid) not in alive_ids]
+                for tid in to_del:
+                    del history_px_by_track[tid]
+
+            try:
+                cv2.imshow(window_name, frame)
+                if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                    break
+            except Exception:
+                logger.error("OpenCV display error:\n%s", traceback.format_exc())
+                break
+            frame_index += 1
+    finally:
+        if grabber is not None:
+            grabber.stop()
+        if exporter is not None:
+            exporter.close()
+        if clipper is not None:
+            clipper.close()
+        if p is not None:
+            p.shutdown()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
 
 
 class _ExportWriter:
@@ -928,6 +1350,10 @@ class _EventClipper:
         camera_id: str,
         output_dir: str,
         db_path: str,
+        retention_s: float,
+        quota_warn_pct: float,
+        quota_refuse_pct: float,
+        max_concurrent_writers: int,
         pre_s: float,
         post_s: float,
         cooldown_s: float,
@@ -943,6 +1369,10 @@ class _EventClipper:
         self._camera_id = str(camera_id)
         self._output_dir = str(output_dir)
         self._db_path = str(db_path)
+        self._retention_s = max(0.0, float(retention_s))
+        self._quota_warn_pct = float(quota_warn_pct)
+        self._quota_refuse_pct = float(quota_refuse_pct)
+        self._max_concurrent_writers = max(1, int(max_concurrent_writers))
         self._pre_s = max(0.0, float(pre_s))
         self._post_s = max(0.0, float(post_s))
         self._cooldown_s = max(0.0, float(cooldown_s))
@@ -956,12 +1386,45 @@ class _EventClipper:
         self._angle_min_deg = float(angle_min_deg)
         self._angle_speed_limit_kmh = float(angle_speed_limit_kmh)
 
+        self._pre_buf_max_frames = max(1, int(math.ceil(self._pre_s * self._fps)) + 2)
         self._pre_buf: "deque[Tuple[float, Any]]" = deque()
+        self._pre_buf_last_ts: Optional[float] = None
+        self._pre_buf_high_water = 0
+        self._pre_buf_dropped_total = 0
+        self._pre_buf_dropped_last_total = 0
+        self._pre_buf_nonmonotonic_total = 0
+        self._pre_buf_last_drop_log_wall_s = 0.0
         self._active: Dict[int, Dict[str, Any]] = {}
         self._last_event_ts: Dict[int, float] = {}
         self._over_state: Dict[int, Dict[str, Any]] = {}
+        self._last_cleanup_wall_s = 0.0
+        self._last_quota_warn_wall_s = 0.0
+
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "event_clipper_config",
+                extra={
+                    "camera_id": self._camera_id,
+                    "output_dir": self._output_dir,
+                    "db_path": self._db_path,
+                    "pre_s": float(self._pre_s),
+                    "post_s": float(self._post_s),
+                    "cooldown_s": float(self._cooldown_s),
+                    "min_consecutive_samples": int(self._min_consecutive_samples),
+                    "min_duration_s": float(self._min_duration_s),
+                    "max_gap_s": float(self._max_gap_s),
+                    "speed_limit_kmh": float(self._speed_limit_kmh),
+                    "angle_min_deg": float(self._angle_min_deg),
+                    "angle_speed_limit_kmh": float(self._angle_speed_limit_kmh),
+                    "fps": float(self._fps),
+                    "quota_warn_pct": float(self._quota_warn_pct),
+                    "quota_refuse_pct": float(self._quota_refuse_pct),
+                    "max_concurrent_writers": int(self._max_concurrent_writers),
+                },
+            )
 
         Path(self._output_dir).mkdir(parents=True, exist_ok=True)
+        self._cleanup_partials(now_wall_s=time.time())
         db_parent = Path(self._db_path).parent
         if str(db_parent) not in {".", ""}:
             db_parent.mkdir(parents=True, exist_ok=True)
@@ -991,6 +1454,15 @@ class _EventClipper:
             return None
         out_dir = str(cfg.get("output_dir", "outputs/clips") or "outputs/clips").strip()
         db_path = str(cfg.get("db_path", "outputs/events.sqlite") or "outputs/events.sqlite").strip()
+        retention_days = cfg.get("retention_days")
+        retention_s = cfg.get("retention_s")
+        if retention_s is None:
+            retention_s = 0.0
+            if retention_days is not None:
+                retention_s = float(retention_days) * 86400.0
+        quota_warn_pct = float(cfg.get("quota_warn_pct", 0.90))
+        quota_refuse_pct = float(cfg.get("quota_refuse_pct", 0.95))
+        max_concurrent_writers = int(cfg.get("max_concurrent_writers", 2))
         pre_s = float(cfg.get("pre_s", 15.0))
         post_s = float(cfg.get("post_s", 15.0))
         cooldown_s = float(cfg.get("cooldown_s", 10.0))
@@ -1021,11 +1493,23 @@ class _EventClipper:
             )
         if fps < 0.0:
             raise ValueError("output.event_clipping.fps must be >= 0")
+        if not (0.0 < quota_warn_pct < 1.0):
+            raise ValueError("output.event_clipping.quota_warn_pct must be in (0, 1)")
+        if not (0.0 < quota_refuse_pct < 1.0):
+            raise ValueError("output.event_clipping.quota_refuse_pct must be in (0, 1)")
+        if quota_refuse_pct <= quota_warn_pct:
+            raise ValueError("output.event_clipping.quota_refuse_pct must be > quota_warn_pct")
+        if int(max_concurrent_writers) <= 0:
+            raise ValueError("output.event_clipping.max_concurrent_writers must be > 0")
         return _EventClipper(
             enabled=True,
             camera_id=camera_id,
             output_dir=out_dir,
             db_path=db_path,
+            retention_s=float(retention_s),
+            quota_warn_pct=float(quota_warn_pct),
+            quota_refuse_pct=float(quota_refuse_pct),
+            max_concurrent_writers=int(max_concurrent_writers),
             pre_s=pre_s,
             post_s=post_s,
             cooldown_s=cooldown_s,
@@ -1038,15 +1522,106 @@ class _EventClipper:
             fps=fps,
         )
 
+    def _disk_fill_ratio(self) -> Optional[float]:
+        try:
+            total, used, _free = shutil.disk_usage(self._output_dir)
+        except Exception:
+            return None
+        if total <= 0:
+            return None
+        return float(used) / float(total)
+
+    def _cleanup_partials(self, *, now_wall_s: float) -> None:
+        try:
+            for p in Path(self._output_dir).glob("*.partial"):
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _cleanup_old_clips(self, *, now_wall_s: float) -> None:
+        if self._retention_s <= 0.0:
+            return
+        if (now_wall_s - float(self._last_cleanup_wall_s)) < 60.0:
+            return
+        self._last_cleanup_wall_s = float(now_wall_s)
+
+        active_paths = {str(st.get("tmp_path", "")) for st in self._active.values()} | {
+            str(st.get("final_path", "")) for st in self._active.values()
+        }
+        cutoff = float(now_wall_s) - float(self._retention_s)
+        for p in Path(self._output_dir).glob("*.avi"):
+            sp = str(p)
+            if sp in active_paths:
+                continue
+            try:
+                if float(p.stat().st_mtime) >= cutoff:
+                    continue
+            except Exception:
+                continue
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                continue
+            try:
+                self._conn.execute("DELETE FROM events WHERE clip_path = ?", (sp,))
+                self._conn.commit()
+            except Exception:
+                pass
+
     def update(self, *, frame_bgr: Any, out: Dict[str, Any]) -> None:
         if not self._enabled:
             return
         t_s = float(out.get("timestamp_s", 0.0))
+        now_wall = time.time()
+        self._cleanup_old_clips(now_wall_s=float(now_wall))
         if frame_bgr is None:
             return
-        self._pre_buf.append((t_s, frame_bgr.copy()))
-        while self._pre_buf and (t_s - float(self._pre_buf[0][0])) > self._pre_s:
-            self._pre_buf.popleft()
+        if not hasattr(frame_bgr, "copy"):
+            return
+
+        dropped_full = 0
+        dropped_time = 0
+        if self._pre_buf_last_ts is not None and t_s <= float(self._pre_buf_last_ts):
+            self._pre_buf_nonmonotonic_total += 1
+        else:
+            while len(self._pre_buf) >= int(self._pre_buf_max_frames):
+                self._pre_buf.popleft()
+                dropped_full += 1
+            self._pre_buf.append((t_s, frame_bgr.copy()))
+            self._pre_buf_last_ts = float(t_s)
+
+            while self._pre_buf and (t_s - float(self._pre_buf[0][0])) > self._pre_s:
+                self._pre_buf.popleft()
+                dropped_time += 1
+
+            self._pre_buf_high_water = max(int(self._pre_buf_high_water), int(len(self._pre_buf)))
+
+        if dropped_full or dropped_time:
+            self._pre_buf_dropped_total += int(dropped_full + dropped_time)
+            now_wall = time.time()
+            if logger.isEnabledFor(logging.WARNING) and (now_wall - float(self._pre_buf_last_drop_log_wall_s)) >= 10.0:
+                dropped_since = int(self._pre_buf_dropped_total - int(self._pre_buf_dropped_last_total))
+                logger.warning(
+                    "frame_drop_summary",
+                    extra={
+                        "camera_id": self._camera_id,
+                        "timestamp_s": float(t_s),
+                        "buffer": "event_prebuffer",
+                        "drop_reason": "prebuffer_trim",
+                        "dropped": int(dropped_since),
+                        "dropped_total": int(self._pre_buf_dropped_total),
+                        "buffer_occupancy": int(len(self._pre_buf)),
+                        "buffer_limit": int(self._pre_buf_max_frames),
+                        "buffer_high_water": int(self._pre_buf_high_water),
+                        "nonmonotonic_total": int(self._pre_buf_nonmonotonic_total),
+                        "window_s": 10.0,
+                    },
+                )
+                self._pre_buf_last_drop_log_wall_s = float(now_wall)
+                self._pre_buf_dropped_last_total = int(self._pre_buf_dropped_total)
 
         to_close: List[int] = []
         for tid, st in list(self._active.items()):
@@ -1064,6 +1639,48 @@ class _EventClipper:
                     st["writer"].release()
                 except Exception:
                     pass
+                tmp_path = str(st.get("tmp_path", ""))
+                final_path = str(st.get("final_path", ""))
+                if tmp_path and final_path:
+                    try:
+                        os.replace(tmp_path, final_path)
+                    except Exception:
+                        try:
+                            Path(tmp_path).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        continue
+                    logger.info(
+                        "clip_finalized",
+                        extra={
+                            "camera_id": self._camera_id,
+                            "track_id": int(tid),
+                            "timestamp_s": float(t_s),
+                            "path": str(final_path),
+                        },
+                    )
+                    evt = st.get("event")
+                    if isinstance(evt, dict):
+                        try:
+                            self._conn.execute(
+                                "INSERT INTO events (camera_id, track_id, timestamp_s, speed_kmh, angle_deg, angular_rate_deg_s, "
+                                "speed_limit_kmh, angle_min_deg, angle_speed_limit_kmh, clip_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                (
+                                    str(evt["camera_id"]),
+                                    int(evt["track_id"]),
+                                    float(evt["timestamp_s"]),
+                                    float(evt["speed_kmh"]),
+                                    float(evt["angle_deg"]),
+                                    float(evt["angular_rate_deg_s"]),
+                                    float(evt["speed_limit_kmh"]),
+                                    float(evt["angle_min_deg"]),
+                                    float(evt["angle_speed_limit_kmh"]),
+                                    str(final_path),
+                                ),
+                            )
+                            self._conn.commit()
+                        except Exception:
+                            pass
 
         tracks = out.get("tracks", []) or []
         for tr in tracks:
@@ -1101,6 +1718,25 @@ class _EventClipper:
                 continue
             count = int(st_over.get("count", 0.0))
             duration = float(t_s) - float(st_over.get("first_ts", t_s))
+
+            if logger.isEnabledFor(logging.DEBUG):
+                last_dbg = float(st_over.get("last_debug_ts", -1e9))
+                if (t_s - last_dbg) >= 5.0:
+                    st_over["last_debug_ts"] = float(t_s)
+                    logger.debug(
+                        "clip_candidate",
+                        extra={
+                            "camera_id": self._camera_id,
+                            "track_id": int(tid),
+                            "timestamp_s": float(t_s),
+                            "speed_kmh": float(speed_kmh),
+                            "angle_deg": float(angle_deg),
+                            "count": int(count),
+                            "duration_s": float(duration),
+                            "min_consecutive_samples": int(self._min_consecutive_samples),
+                            "min_duration_s": float(self._min_duration_s),
+                        },
+                    )
             if count < int(self._min_consecutive_samples):
                 continue
             if duration < float(self._min_duration_s):
@@ -1112,17 +1748,190 @@ class _EventClipper:
             if tid in self._active:
                 continue
 
-            clip_name = f"{self._camera_id}_track{tid}_{int(t_s * 1000.0)}.avi"
-            clip_path = str(Path(self._output_dir) / clip_name)
+            fill = self._disk_fill_ratio()
+            if fill is not None:
+                if float(fill) >= float(self._quota_refuse_pct):
+                    logger.warning(
+                        "clip_refused",
+                        extra={
+                            "camera_id": self._camera_id,
+                            "track_id": int(tid),
+                            "timestamp_s": float(t_s),
+                            "reason": "disk_quota_refuse",
+                            "disk_fill_pct": float(fill * 100.0),
+                            "quota_refuse_pct": float(self._quota_refuse_pct * 100.0),
+                        },
+                    )
+                    continue
+                if float(fill) >= float(self._quota_warn_pct) and (now_wall - float(self._last_quota_warn_wall_s)) >= 30.0:
+                    logger.warning(
+                        "disk_quota_warning",
+                        extra={
+                            "camera_id": self._camera_id,
+                            "timestamp_s": float(t_s),
+                            "disk_fill_pct": float(fill * 100.0),
+                            "quota_warn_pct": float(self._quota_warn_pct * 100.0),
+                        },
+                    )
+                    self._last_quota_warn_wall_s = float(now_wall)
+
+            if len(self._active) >= int(self._max_concurrent_writers):
+                logger.warning(
+                    "clip_refused",
+                    extra={
+                        "camera_id": self._camera_id,
+                        "track_id": int(tid),
+                        "timestamp_s": float(t_s),
+                        "reason": "writer_limit",
+                        "active_writers": int(len(self._active)),
+                        "max_concurrent_writers": int(self._max_concurrent_writers),
+                    },
+                )
+                continue
+
+            base_name = f"{self._camera_id}_track{tid}_{int(t_s * 1000.0)}"
 
             import cv2
 
             h, w = frame_bgr.shape[:2]
-            fourcc = cv2.VideoWriter_fourcc(*"XVID")
-            writer = cv2.VideoWriter(clip_path, fourcc, float(self._fps), (int(w), int(h)))
-            if not writer.isOpened():
-                writer.release()
-                raise RuntimeError(f"Failed to open AVI writer: {clip_path}")
+
+            class _FfmpegWriter:
+                def __init__(self, path: str, fps: float, width: int, height: int) -> None:
+                    exe = shutil.which("ffmpeg")
+                    if not exe:
+                        raise RuntimeError("ffmpeg_not_found")
+                    self._path = str(path)
+                    self._proc = subprocess.Popen(
+                        [
+                            str(exe),
+                            "-y",
+                            "-f",
+                            "rawvideo",
+                            "-pix_fmt",
+                            "bgr24",
+                            "-s",
+                            f"{int(width)}x{int(height)}",
+                            "-r",
+                            str(float(fps)),
+                            "-i",
+                            "-",
+                            "-an",
+                            "-vcodec",
+                            "mjpeg",
+                            "-q:v",
+                            "5",
+                            "-f",
+                            "avi",
+                            str(path),
+                        ],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+
+                def write(self, frame) -> None:
+                    p = self._proc
+                    if p is None or p.stdin is None:
+                        return
+                    if p.poll() is not None:
+                        return
+                    try:
+                        p.stdin.write(frame.tobytes())
+                    except Exception:
+                        return
+
+                def release(self) -> None:
+                    p = self._proc
+                    if p is None:
+                        return
+                    try:
+                        if p.stdin is not None:
+                            try:
+                                p.stdin.flush()
+                            except Exception:
+                                pass
+                            try:
+                                p.stdin.close()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    try:
+                        p.wait(timeout=3.0)
+                    except Exception:
+                        try:
+                            p.kill()
+                        except Exception:
+                            pass
+                    self._proc = None
+
+            writer: Any = None
+            chosen_writer = ""
+            chosen_fourcc = ""
+            tried: List[str] = []
+            tmp_path = ""
+            final_path = ""
+            for tag in ("XVID", "MJPG"):
+                tried.append(f"cv2:{tag}.avi")
+                final_path = str(Path(self._output_dir) / (base_name + ".avi"))
+                tmp_path = final_path + ".partial"
+                try:
+                    Path(tmp_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                try:
+                    fourcc = cv2.VideoWriter_fourcc(*tag)
+                    w0 = cv2.VideoWriter(tmp_path, fourcc, float(self._fps), (int(w), int(h)))
+                except Exception:
+                    continue
+                if w0 is not None and w0.isOpened():
+                    writer = w0
+                    chosen_writer = "cv2"
+                    chosen_fourcc = tag
+                    break
+                try:
+                    if w0 is not None:
+                        w0.release()
+                except Exception:
+                    pass
+
+            if writer is None:
+                tried.append("ffmpeg:mjpeg")
+                try:
+                    final_path = str(Path(self._output_dir) / (base_name + ".avi"))
+                    tmp_path = final_path + ".partial"
+                    try:
+                        Path(tmp_path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    writer = _FfmpegWriter(tmp_path, float(self._fps), int(w), int(h))
+                    chosen_writer = "ffmpeg"
+                except Exception:
+                    writer = None
+
+            if writer is None:
+                try:
+                    if tmp_path:
+                        Path(tmp_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                logger.error(
+                    "clip_writer_open_failed",
+                    extra={
+                        "camera_id": self._camera_id,
+                        "track_id": int(tid),
+                        "timestamp_s": float(t_s),
+                        "tmp_path": str(tmp_path),
+                        "final_path": str(final_path),
+                        "fps": float(self._fps),
+                        "width": int(w),
+                        "height": int(h),
+                        "tried": tried,
+                        "ffmpeg_found": True if shutil.which("ffmpeg") else False,
+                    },
+                )
+                continue
 
             for _ts0, f0 in list(self._pre_buf):
                 writer.write(f0)
@@ -1131,27 +1940,39 @@ class _EventClipper:
                 "writer": writer,
                 "end_ts": float(t_s + self._post_s),
                 "last_written_ts": float(t_s),
-                "clip_path": clip_path,
+                "tmp_path": tmp_path,
+                "final_path": final_path,
+                "writer_backend": str(chosen_writer),
+                "fourcc": chosen_fourcc,
+                "event": {
+                    "camera_id": str(self._camera_id),
+                    "track_id": int(tid),
+                    "timestamp_s": float(t_s),
+                    "speed_kmh": float(speed_kmh),
+                    "angle_deg": float(angle_deg),
+                    "angular_rate_deg_s": float(angular_rate),
+                    "speed_limit_kmh": float(self._speed_limit_kmh),
+                    "angle_min_deg": float(self._angle_min_deg),
+                    "angle_speed_limit_kmh": float(self._angle_speed_limit_kmh),
+                },
             }
             self._last_event_ts[tid] = float(t_s)
 
-            self._conn.execute(
-                "INSERT INTO events (camera_id, track_id, timestamp_s, speed_kmh, angle_deg, angular_rate_deg_s, "
-                "speed_limit_kmh, angle_min_deg, angle_speed_limit_kmh, clip_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    str(self._camera_id),
-                    int(tid),
-                    float(t_s),
-                    float(speed_kmh),
-                    float(angle_deg),
-                    float(angular_rate),
-                    float(self._speed_limit_kmh),
-                    float(self._angle_min_deg),
-                    float(self._angle_speed_limit_kmh),
-                    str(clip_path),
-                ),
+            logger.info(
+                "clip_started",
+                extra={
+                    "camera_id": self._camera_id,
+                    "track_id": int(tid),
+                    "timestamp_s": float(t_s),
+                    "speed_kmh": float(speed_kmh),
+                    "angle_deg": float(angle_deg),
+                    "pre_s": float(self._pre_s),
+                    "post_s": float(self._post_s),
+                    "writer_backend": str(chosen_writer),
+                    "fourcc": str(chosen_fourcc),
+                    "path": str(final_path),
+                },
             )
-            self._conn.commit()
 
     def close(self) -> None:
         for st in list(self._active.values()):
@@ -1159,11 +1980,163 @@ class _EventClipper:
                 st["writer"].release()
             except Exception:
                 pass
+            tmp_path = str(st.get("tmp_path", ""))
+            final_path = str(st.get("final_path", ""))
+            if tmp_path and final_path:
+                try:
+                    os.replace(tmp_path, final_path)
+                except Exception:
+                    try:
+                        Path(tmp_path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    continue
+                evt = st.get("event")
+                if isinstance(evt, dict):
+                    try:
+                        self._conn.execute(
+                            "INSERT INTO events (camera_id, track_id, timestamp_s, speed_kmh, angle_deg, angular_rate_deg_s, "
+                            "speed_limit_kmh, angle_min_deg, angle_speed_limit_kmh, clip_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (
+                                str(evt["camera_id"]),
+                                int(evt["track_id"]),
+                                float(evt["timestamp_s"]),
+                                float(evt["speed_kmh"]),
+                                float(evt["angle_deg"]),
+                                float(evt["angular_rate_deg_s"]),
+                                float(evt["speed_limit_kmh"]),
+                                float(evt["angle_min_deg"]),
+                                float(evt["angle_speed_limit_kmh"]),
+                                str(final_path),
+                            ),
+                        )
+                        self._conn.commit()
+                    except Exception:
+                        pass
         self._active.clear()
         try:
             self._conn.close()
         except Exception:
             pass
+
+
+def run_healthcheck(*, cfg: Optional[V5PipelineConfig], source: Optional[CameraSource], raw_cfg: Dict[str, Any]) -> int:
+    errors: List[str] = []
+    warnings: List[str] = []
+
+    if cfg is None or source is None:
+        cfg0, src0 = default_config()
+        if cfg is None:
+            cfg = cfg0
+        if source is None:
+            source = src0
+
+    if cfg is None or source is None:
+        print("healthcheck: missing config")
+        return 2
+
+    src_display = _redact_source(source)
+    print(f"healthcheck: camera_id={cfg.camera_id} source={src_display}")
+
+    try:
+        import cv2  # type: ignore
+    except Exception as e:
+        errors.append(f"opencv_import_failed: {e}")
+        cv2 = None  # type: ignore
+
+    det_cfg = dict(cfg.detection or {})
+    if bool(det_cfg.get("enabled", True)):
+        try:
+            import ultralytics  # type: ignore
+
+            _ = ultralytics
+        except Exception as e:
+            errors.append(f"ultralytics_missing_or_broken: {e}")
+
+    out_cfg = dict((raw_cfg.get("output", {}) or {}))
+    event_cfg = dict(out_cfg.get("event_clipping", {}) or {})
+    if bool(event_cfg.get("enabled", False)):
+        out_dir = str(event_cfg.get("output_dir", "outputs/clips") or "outputs/clips").strip()
+        db_path = str(event_cfg.get("db_path", "outputs/events.sqlite") or "outputs/events.sqlite").strip()
+        try:
+            Path(out_dir).mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            errors.append(f"event_output_dir_unwritable: {out_dir} ({e})")
+        try:
+            db_parent = Path(db_path).parent
+            if str(db_parent) not in {".", ""}:
+                db_parent.mkdir(parents=True, exist_ok=True)
+            p = db_parent / "__healthcheck_write.tmp"
+            p.write_bytes(b"ok")
+            p.unlink(missing_ok=True)
+        except Exception as e:
+            errors.append(f"event_db_parent_unwritable: {db_path} ({e})")
+
+        if cv2 is not None:
+            runtime_cfg = dict(getattr(cfg, "runtime", {}) or {})
+            resize = dict(runtime_cfg.get("resize", {}) or {})
+            w = int(resize.get("width", 640) or 640)
+            h = int(resize.get("height", 480) or 480)
+            if bool(resize.get("enabled", False)):
+                w = int(resize.get("width", w) or w)
+                h = int(resize.get("height", h) or h)
+            w = max(16, int(w))
+            h = max(16, int(h))
+            fps_hint = float(runtime_cfg.get("fps_hint", 30.0) or 30.0)
+            fps_hint = 30.0 if fps_hint <= 0 else float(fps_hint)
+
+            import numpy as np
+
+            frame = np.zeros((h, w, 3), dtype=np.uint8)
+            writer_ok = False
+            tried: List[str] = []
+            for tag in ("XVID", "MJPG"):
+                tried.append(tag)
+                tmp_path = str(Path(out_dir) / f"__healthcheck_{tag}.avi")
+                try:
+                    fourcc = cv2.VideoWriter_fourcc(*tag)
+                    vw = cv2.VideoWriter(tmp_path, fourcc, float(fps_hint), (int(w), int(h)))
+                except Exception:
+                    continue
+                try:
+                    if vw is not None and vw.isOpened():
+                        vw.write(frame)
+                        vw.release()
+                        try:
+                            Path(tmp_path).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        writer_ok = True
+                        break
+                finally:
+                    try:
+                        if vw is not None:
+                            vw.release()
+                    except Exception:
+                        pass
+                    try:
+                        Path(tmp_path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            if not writer_ok:
+                if shutil.which("ffmpeg"):
+                    warnings.append(f"opencv_videowriter_unavailable_but_ffmpeg_present: tried={tried} out_dir={out_dir}")
+                else:
+                    errors.append(f"opencv_videowriter_unavailable_and_no_ffmpeg: tried={tried} out_dir={out_dir}")
+
+    if isinstance(source, str) and str(source).strip() == "":
+        errors.append("camera_source_empty")
+
+    if warnings:
+        for w in warnings:
+            print(f"healthcheck_warning: {w}")
+    if errors:
+        for e in errors:
+            print(f"healthcheck_error: {e}")
+        print("healthcheck: FAIL")
+        return 1
+    print("healthcheck: OK")
+    return 0
 
 
 if __name__ == "__main__":
@@ -1180,12 +2153,16 @@ if __name__ == "__main__":
     out_cfg = dict(raw_cfg.get("output", {}) or {})
     log_cfg = dict(out_cfg.get("logging", {}) or {})
     level_name = "DEBUG" if bool(args.verbose) else str(log_cfg.get("level", "INFO") or "INFO")
-    handlers: List[Any] = []
+    file_path = ""
     if bool(log_cfg.get("save_to_file", False)):
         file_path = str(log_cfg.get("file_path", "speed_estimation.log") or "speed_estimation.log")
-        handlers.append(logging.FileHandler(file_path, encoding="utf-8"))
-    handlers.append(logging.StreamHandler())
-    logging.basicConfig(level=getattr(logging, level_name.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(message)s", handlers=handlers, force=True)
+    log_format = str(log_cfg.get("format", "text") or "text")
+    rotate_mb = float(log_cfg.get("rotate_mb", 0.0) or 0.0)
+    backup_count = int(log_cfg.get("backup_count", 5) or 5)
+    configure_logging(level=level_name, fmt=log_format, file_path=file_path, rotate_mb=rotate_mb, backup_count=backup_count)
+
+    if bool(args.healthcheck):
+        raise SystemExit(run_healthcheck(cfg=cfg, source=source, raw_cfg=raw_cfg))
 
     display_cfg = dict(out_cfg.get("display", {}) or {})
     window_name = str(args.window)
